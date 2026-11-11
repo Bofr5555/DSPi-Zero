@@ -1,0 +1,11 @@
+# DSPi bare-metal boot config for the Pi Zero, Zero W (BCM2835) and Zero 2 W (BCM2837).
+kernel=kernel.img
+# pizero.ld links for 0x8000. Without this, firmware 1.20260915 loaded the image at 0x0 on a Zero W.
+kernel_address=0x8000
+# Our code programs the PL011 for 48 MHz before it can ask the mailbox.
+init_uart_clock=48000000
+enable_uart=1
+# bootcode.bin and start.elf print their own boot log on UART0 at 115200 before our code starts.
+uart_2ndstage=1
+# The Zero 2 W image is 32-bit. The first-generation Zero ignores this.
+arm_64bit=0
