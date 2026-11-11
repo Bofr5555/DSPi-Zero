@@ -32,7 +32,7 @@ The first-generation Zero was the only unit on hand when this plan was written. 
 These parts should port with little change:
 
 - The RP2350 float DSP pipeline (`dsp_pipeline.c` and the filter, crossover, leveller, limiter and loudness modules). It is plain C. The DCP helpers in `dcp_inline.h` become ordinary `double` arithmetic, because both Pi chips have hardware double precision.
-- The vendor command dispatcher, bulk params, notify endpoint and the custom UAC1 class driver. These sit on TinyUSB already.
+- The vendor command dispatcher, bulk params and notify endpoint. These sit on TinyUSB already. *Update (2026-11-11): the Zero uses UAC2 at High Speed through TinyUSB's own audio class instead of DSPi's UAC1 class driver. See "USB audio: UAC2 at High Speed" below.*
 - The wire format, so DSPi Console can talk to the device unchanged apart from recognising a new platform ID.
 
 These parts have to be rebuilt:
@@ -101,6 +101,16 @@ Count isochronous OUT packets and bytes, and report them on the UART. Exercise s
 ### Loading builds over USB
 
 *Added: 2026-11-11.* The SD card now holds a USB loader instead of a milestone image. `tools/pizero_load.py` reboots a running image to the loader and sends the new build over USB, so no card swaps are needed. A round trip takes about 7 s. See `PiZero_Z0_bringup.md` section 13.
+
+### USB audio: UAC2 at High Speed
+
+*Added: 2026-11-11.* The Zero 2 W's USB is High Speed, so the Zero moves from UAC1 at Full Speed (Z2 and Z3) to UAC2 at 480 Mbit/s, using TinyUSB's built-in audio class. DSPi Console is unaffected, because it talks to the board only over EP0 and the vendor interface, which keep the same layout. The work is in `firmware/PiZero/uac2`, with these supporting pieces.
+
+- **Interrupt-driven USB.** At High Speed the bus runs in 125 us microframes, too fast for a polled main loop that will also run DSP blocks. GPU IRQ 9 now reaches the ARM, and `startup.S` saves the VFP caller-saved registers in the IRQ entry.
+- **A patched DWC2 driver** (`firmware/PiZero/tusb_dwc2/dcd_dwc2.c`). It fixes the slave-mode OUT disable hang and isochronous frame parity in the driver, so any class driver benefits.
+- **The test.** `tools/uac2_stream_check.py` plays straight to the Pi's output by name, so the Mac's default output is never changed.
+
+Details are in `PiZero_Z0_bringup.md` section 14. Z4 builds on this front end, with the DSP pipeline, vendor commands and bulk params compiled unchanged against stand-in Pico SDK headers.
 
 ### Z4. DSPi base running on the received audio
 

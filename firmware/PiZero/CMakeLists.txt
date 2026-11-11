@@ -183,3 +183,25 @@ add_custom_command(TARGET pizero_loader POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_LIST_DIR}/boot/config_loader.txt ${CMAKE_CURRENT_BINARY_DIR}/sdcard-loader/config.txt
     VERBATIM
 )
+
+# UAC2 at High Speed: TinyUSB's audio class, interrupt-driven, on the patched DWC2 driver in tusb_dwc2/.
+# Loaded over USB with tools/pizero_load.py (not staged on the SD card).
+set(DWC2_DIR ${TUSB_DIR}/portable/synopsys/dwc2)
+add_library(tinyusb_uac2 STATIC
+    ${TUSB_DIR}/tusb.c
+    ${TUSB_DIR}/common/tusb_fifo.c
+    ${TUSB_DIR}/device/usbd.c
+    ${TUSB_DIR}/device/usbd_control.c
+    ${TUSB_DIR}/class/audio/audio_device.c
+    ${CMAKE_CURRENT_LIST_DIR}/tusb_dwc2/dcd_dwc2.c
+    ${DWC2_DIR}/dwc2_common.c
+)
+target_include_directories(tinyusb_uac2 PUBLIC ${CMAKE_CURRENT_LIST_DIR}/uac2 ${TUSB_DIR} ${DWC2_DIR})
+target_link_libraries(tinyusb_uac2 PUBLIC bcm_peripherals)
+target_compile_options(tinyusb_uac2 PRIVATE ${COMMON_FLAGS} -O2 -g -std=c17 -Wall)
+
+add_executable(pizero_uac2 ${PLATFORM_SRC} irq.c uac2/main_uac2.c uac2/usb_descriptors.c)
+# uac2 first, so its tusb_config.h wins over the loader's (pizero_image adds loader/ for loader_proto.h).
+target_include_directories(pizero_uac2 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2)
+target_link_libraries(pizero_uac2 PRIVATE tinyusb_uac2)
+pizero_image(pizero_uac2)

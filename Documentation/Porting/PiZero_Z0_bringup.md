@@ -337,3 +337,69 @@ Image bytes go to bulk OUT EP `0x01` and are written straight to `0x8000`, up to
 **Reboot to the loader.** `board_reboot()` in `board.c` does a full reset through the power manager watchdog (`PM_WDOG`, then `PM_RSTC` full reset, at peripheral base + `0x100000`). The GPU firmware then boots the loader from the card again. Z2 calls it for vendor request `0x40` once the status stage is done. `0x40` is one of the codes DSPi's command set leaves free. A hung image cannot answer, so it still needs a power cycle.
 
 **2026-11-11: tested on the Zero 2 W.** With the loader waiting, `pizero_load.py` sent `pizero_z2.img` (30048 bytes, CRC-32 `15054b53`) in 0.07 s, and the board enumerated as `Weeb Labs DSPi Zero`. `z3_stream_check.py` then passed 3 cycles at 1000.0 packets per second. A second load went through reboot-to-loader. The loader was back 7.1 s after the request, the whole round trip took 7 s, and the reloaded image passed the check again. A CRC mismatch and an oversized image are rejected by the loader in code, but neither case has been tried on hardware.
+
+## 14. UAC2 at High Speed
+
+*Added: 2026-11-11*
+
+The Zero 2 W's USB runs at High Speed, so the audio front end moved from UAC1 at Full Speed to UAC2 at 480 Mbit/s, using TinyUSB's own audio class (`audio_device.c`). DSPi Console only uses EP0 and the vendor interface, which keep their layout, so the audio class change does not affect it. The image is `pizero_uac2.img`, loaded over USB:
+
+```bash
+cmake --build firmware/PiZero/build-zero2
+/opt/homebrew/bin/python3.14 firmware/PiZero/tools/pizero_load.py firmware/PiZero/build-zero2/pizero_uac2.img
+/opt/homebrew/bin/python3.14 firmware/PiZero/tools/uac2_stream_check.py 20
+```
+
+**Device** (`uac2/usb_descriptors.c`). The device is `2E8B:FEAA`, bcdDevice `0x0300`, "Weeb Labs DSPi Zero", with the board serial. The audio function is a UAC2 speaker with these entities:
+
+- clock source 4, with 44.1, 48 and 96 kHz
+- input terminal 1
+- feature unit 2, master mute and volume, -60 to 0 dB in 1 dB steps
+- output terminal 3
+
+Streaming alt 1 is stereo 16-bit and alt 2 is stereo 24-bit (3-byte subslots). Data OUT EP `0x01` runs every microframe (`bInterval` 1, 78 bytes maximum). The explicit feedback IN EP `0x82` runs every 1 ms (`bInterval` 4, 16.16 format). The vendor interface 2 keeps the bulk notify EP `0x83` at 512 bytes, the High Speed bulk size. A small app class driver in `uac2/main_uac2.c` claims it. Feedback uses TinyUSB's FIFO-count method. A timer-paced consumer in the main loop reads the sample rate's worth of audio each millisecond, standing in for an audio output. It starts once the FIFO is half full.
+
+**Interrupts** (`irq.c`, `startup.S`). The USB controller is GPU IRQ 9 on the legacy interrupt controller, which reaches core 0. The IRQ entry saves r0-r3, r12 and lr, FPSCR and the VFP caller-saved registers (d0-d7, plus d16-d31 on the A53), then calls `irq_handler()`. `irq.c` dispatches to registered handlers and implements TinyUSB's `BP_EnableIRQ`/`BP_DisableIRQ`, which mask the USB IRQ around TinyUSB's event queue. Images without `irq.c` get a weak `irq_handler()` in `board.c` that reports a fault, as before. The main loop only runs `tud_task()`, the consumer and buffered UART output.
+
+**Patched DWC2 driver** (`tusb_dwc2/dcd_dwc2.c`, a copy of TinyUSB 0.18.0's driver with each change marked "DSPi PiZero patch"). TinyUSB's audio class re-activates the iso endpoints on every `SET_INTERFACE` and re-arms feedback on completion. On this controller in slave mode, that hit the same two problems as Z3, so the fixes now live in the driver.
+
+1. **Disabling an enabled OUT endpoint.** The driver waits for global OUT NAK effective. In slave mode that status only arrives through the RX FIFO, so the wait loop now pops the RX FIFO itself.
+2. **Frame parity for iso endpoints with `bInterval` > 1.**
+   - **The problem.** The host polls these endpoints on (micro)frames of one parity, and TinyUSB only sets parity for `bInterval` 1.
+   - **Learning the parity.** The driver records the host's parity per endpoint. It reads it from the RX status frame number for OUT, and from the `EONUM` bit after a sent packet for IN. From then on it queues every packet on that parity.
+   - **Until it is learned.** The SOF handler holds each parity for 16 (micro)frames in turn, which covers at least two polls, and keeps the SOF interrupt on. A first version followed every frame instead. It failed permanently once the host's IN token came before our SOF interrupt in the microframe, so the packet always carried the previous frame's parity.
+   - **Where it applies.** It works for the feedback IN endpoint. For OUT, this controller fixes the parity when the endpoint is enabled and ignores later writes. A 1 ms data endpoint therefore only worked when the first guess was right (1 stream in 11), which is why data stays at `bInterval` 1. There, TinyUSB's own next-frame parity is used.
+
+The patched driver also exports `dcd_dwc2_iso_parity()` for diagnostics.
+
+**TinyUSB workaround in the app.** When a stream stops, a feedback packet is usually still queued. On the next `SET_INTERFACE` the class calls `usbd_edpt_clear_stall()`, which clears `busy` but not `claimed` (`usbd.c` 1418-1419). The class's `usbd_edpt_claim()` then fails for good. `tud_audio_set_itf_cb()` releases the feedback endpoint whenever a streaming alt is selected.
+
+**Bench counters.** Vendor request `0x4F` returns a `0x5532` ("U2") block. It holds uptime, rate, alt, mount state and speed, then counters, then diagnostics:
+
+- counters: class requests, alt changes, rate sets, feedback sent, OUT packets and bytes, consumed bytes, consumer underruns, FIFO level, suspends, resumes, mounts, IRQs taken and spurious
+- diagnostics: `DIEPCTL`, `DIEPTSIZ` and `DIEPINT` of EP 2 IN, `DOEPCTL` of EP 1 OUT, `GINTMSK`, `DSTS`, the feedback busy flag, and both learned parities
+
+Request `0x40` reboots to the loader.
+
+**Test** (`tools/uac2_stream_check.py`). It opens the Pi's output by name through PortAudio (`sounddevice`) and plays a -20 dBFS 1 kHz tone, so the Mac's default output is never changed. It stops with `abort()`, because `stop()` once hung inside CoreAudio. Each cycle stops the stream, which makes the host drop to alt 0, and starts it again. A window passes when four things hold:
+
+- the data is within 0.2% of the sample rate in bytes per second
+- the paced consumer had no underruns
+- feedback ran at over 900 packets per second
+- the device stayed mounted with no suspends
+
+Packet counts are reported but not judged. With feedback reaching the host, it varies the frames per microframe, so about 7990 to 8000 packets carry exactly the sample rate.
+
+**2026-11-11: passed on the Zero 2 W.** The device enumerated at High Speed, and Core Audio listed "Weeb Labs DSPi Zero" with 2 output channels at 48 kHz. The 20-cycle run passed:
+
+| Measure | Result |
+|---|---|
+| Steady stream | 191952 bytes per second |
+| Each of 20 restarts | 191882 to 192102 bytes per second, feedback at 1000 to 1006 per second, 0 underruns in the measured windows |
+| Whole run | 99376860 bytes, 517541 feedback packets, 94 alt changes, 0 suspends, 8.8 million IRQs |
+
+The 40 underruns outside the windows come at stream edges, as the FIFO drains after the host stops. Earlier runs went wrong in three ways before the fixes above:
+
+- Every-microframe retargeting lost feedback for good after 7 restarts.
+- 1 ms data packets only started 1 time in 11.
+- An earlier per-SOF write of the feedback endpoint control register lost about 16 packets a second after a while.

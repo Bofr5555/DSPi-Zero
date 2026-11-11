@@ -52,6 +52,13 @@ static const char *const fault_names[] = {
     "?", "undefined instruction", "SWI", "prefetch abort", "data abort", "reserved", "IRQ", "FIQ",
 };
 
+void fault_handler(uint32_t kind, uint32_t pc, uint32_t spsr, uint32_t dfsr);
+
+// Images that enable interrupts link irq.c, which replaces this. Anything else treats an IRQ as a fault.
+__attribute__((weak)) void irq_handler(void) {
+    fault_handler(6, 0, 0, 0);
+}
+
 // Called from startup.S on any exception. No milestone enables interrupts yet, so IRQ and FIQ are faults too.
 void fault_handler(uint32_t kind, uint32_t pc, uint32_t spsr, uint32_t dfsr) {
     if (uart_ready()) {

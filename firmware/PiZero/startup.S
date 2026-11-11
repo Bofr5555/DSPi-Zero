@@ -160,7 +160,29 @@ __vectors:
     fault_stub pabt_entry,   3, 4
     fault_stub dabt_entry,   4, 8
     fault_stub unused_entry, 5, 4
-    fault_stub irq_entry,    6, 4
+
+/* IRQ: saves what a C call may clobber, including the VFP caller-saved registers and FPSCR, because the
+ * interrupted code may be in the middle of floating-point DSP. irq_handler() is weak in board.c, where it
+ * reports a fault, so images that never enable interrupts behave as before. */
+irq_entry:
+    sub     lr, lr, #4
+    srsdb   sp!, #0x12                  /* lr_irq and spsr_irq onto the IRQ stack */
+    push    {r0-r3, r12, lr}            /* 8 + 24 bytes keeps the stack 8-byte aligned */
+    vmrs    r0, fpscr
+    push    {r0, r1}
+    vpush   {d0-d7}
+#if __ARM_ARCH >= 7
+    vpush   {d16-d31}                   /* VFPv4/NEON has 32 D registers; the VFP11 has 16 */
+#endif
+    bl      irq_handler
+#if __ARM_ARCH >= 7
+    vpop    {d16-d31}
+#endif
+    vpop    {d0-d7}
+    pop     {r0, r1}
+    vmsr    fpscr, r0
+    pop     {r0-r3, r12, lr}
+    rfeia   sp!
     fault_stub fiq_entry,    7, 4
 
 fault_common:
