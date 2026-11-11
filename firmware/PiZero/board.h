@@ -21,6 +21,10 @@
 #define BOARD_UART_CLOCK_HZ     48000000u
 
 void board_led_init(void);
+
+// Full chip reset through the power manager watchdog. The GPU firmware then boots from the SD card again,
+// which with the USB loader card brings the loader back. Never returns.
+void board_reboot(void) __attribute__((noreturn));
 void board_led_write(int on);
 
 // Free-running 1 MHz system timer. Wraps every 71.6 minutes, so compare with unsigned subtraction.

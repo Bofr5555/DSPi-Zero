@@ -22,6 +22,10 @@ _start:
     adr     r11, _start
 
 #if BCM_VERSION == 2837
+    /* Images started by the USB loader get r3 = LOADER_LAUNCH_MAGIC (loader/loader_proto.h) and skip this. */
+    ldr     r0, =0x4C4F4144
+    cmp     r3, r0
+    beq     6f
     /* Sign of life without a UART: 4 s of fast LED flicker (GPIO 29) before anything can hang, ending
      * with the pin high (LED off if active low), unlike the firmware's solid on. Uses r0-r7 only. */
     ldr     r0, =0x3F200000             /* GPIO */
@@ -43,6 +47,7 @@ _start:
     blo     8b
     subs    r4, r4, #1
     bne     7b
+6:
 #endif
 
 #if __ARM_ARCH >= 7

@@ -298,3 +298,42 @@ It plays a -20 dBFS 1 kHz tone with `afplay`, and requires 998 to 1002 packets p
 **Fix 3: feedback stuck on the wrong frame parity.** TinyUSB queues an iso IN packet for the next frame's parity (`dcd_dwc2.c` line 366). The feedback endpoint has `bRefresh = 2`, so the Mac polls it every 4 ms, always on frames of one parity. A packet queued on the other parity after a restart is never sent, and feedback dropped to 1 to 6 packets per switch cycle. The SOF callback now flushes a feedback packet still pending after 6 frames (stall, then clear stall, which disables the IN endpoint and flushes its FIFO), and the next SOF queues it on the other parity.
 
 **2026-11-11: Z3 passed on the Zero 2 W.** The steady stream ran at 1000.0 packets per second and 192000 bytes per second (alt 1, 16-bit, 48 kHz). After each of the ten switches the rate was 999.5 to 1000.5 packets per second, with 849 to 870 feedback packets per 3.5 s window, which is about 250 per second. The run ended with 49149 packets, 9436608 bytes, 22 alt changes, 12277 feedback packets sent, 72 feedback flushes, 0 suspends and 1 mount. Before fixes 2 and 3, the same test measured 993 to 994 packets per second, and feedback stalled after the first switch-away.
+
+## 13. USB loader: new builds without moving the SD card
+
+*Added: 2026-11-11*
+
+`rpiboot` fails from this Mac (section 10), so builds went onto the SD card by hand. The loader replaces that. The card is written once, and every later image goes over USB.
+
+**Set up the card (once).** Build, stage the boot files, and copy `sdcard-loader/` to a FAT32 card as in section 4.
+
+```bash
+cmake -S firmware/PiZero -B firmware/PiZero/build-zero2 -G Ninja -DPIZERO_BOARD=zero2
+cmake --build firmware/PiZero/build-zero2
+sh firmware/PiZero/tools/fetch_boot_firmware.sh "$PWD/firmware/PiZero/build-zero2"
+```
+
+`sdcard-loader/` holds the same `bootcode.bin`, `start.elf` and `fixup.dat`, the loader as `kernel.img`, and `boot/config_loader.txt` as `config.txt`. That config sets `kernel_address=0x02000000`, so the firmware loads the loader at 32 MB. `pizero_loader.ld` links it there, and `pizero.ld` still links every milestone image at `0x8000`. Both include `pizero_sections.ld`. With the loader card in, power the board from the Mac's USB. The LED flickers for 4 s, flashes 3 times, then gives two short flashes a second while the loader waits.
+
+**Load an image.**
+
+```bash
+/opt/homebrew/bin/python3.14 firmware/PiZero/tools/pizero_load.py firmware/PiZero/build-zero2/pizero_z2.img
+```
+
+If the loader is not on USB, the script asks any running image whose product name contains "Zero" to reboot to it, with vendor request `0x40`. It then waits up to 30 s for the loader. Matching by name means a real DSPi on the same `2E8B:FEAA` is never touched. The script sends the image, waits until the loader reports every byte, and sends GO.
+
+**Protocol** (`loader/loader_proto.h`). The loader enumerates as `cafe:5a4c`, "DSPi PiZero USB loader", with one vendor interface. All requests are vendor requests to the device recipient.
+
+| Request | Direction | Data |
+|---|---|---|
+| `0x01` LOAD_BEGIN | OUT | 8 bytes: size, then zlib CRC-32 |
+| `0x02` STATUS | IN | 16 bytes: state, size, bytes received, maximum size |
+| `0x03` GO | OUT | none. Stalls unless every byte arrived and the CRC matches |
+| `0x04` REBOOT | OUT | none. Watchdog reset |
+
+Image bytes go to bulk OUT EP `0x01` and are written straight to `0x8000`, up to the loader at 32 MB. GO invalidates the I-cache and branch predictor, then jumps to `0x8000` in SYS mode with interrupts masked. It passes the firmware's original r0 to r2, and r3 = `0x4C4F4144` ("LOAD"), which makes `startup.S` skip the 4 s flicker. The D-cache is off, so no data-cache cleaning is needed.
+
+**Reboot to the loader.** `board_reboot()` in `board.c` does a full reset through the power manager watchdog (`PM_WDOG`, then `PM_RSTC` full reset, at peripheral base + `0x100000`). The GPU firmware then boots the loader from the card again. Z2 calls it for vendor request `0x40` once the status stage is done. `0x40` is one of the codes DSPi's command set leaves free. A hung image cannot answer, so it still needs a power cycle.
+
+**2026-11-11: tested on the Zero 2 W.** With the loader waiting, `pizero_load.py` sent `pizero_z2.img` (30048 bytes, CRC-32 `15054b53`) in 0.07 s, and the board enumerated as `Weeb Labs DSPi Zero`. `z3_stream_check.py` then passed 3 cycles at 1000.0 packets per second. A second load went through reboot-to-loader. The loader was back 7.1 s after the request, the whole round trip took 7 s, and the reloaded image passed the check again. A CRC mismatch and an oversized image are rejected by the loader in code, but neither case has been tried on hardware.

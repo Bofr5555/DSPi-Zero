@@ -32,6 +32,22 @@ void board_led_init(void) {
     board_led_write(1);
 }
 
+// Power manager watchdog, at the peripheral base + 0x100000 on both chips. Every write needs the password.
+#define BOARD_PM_BASE            (SYSTMR_BASE - 0x3000u + 0x100000u)
+#define PM_RSTC            (*(volatile uint32_t *)(BOARD_PM_BASE + 0x1Cu))
+#define PM_WDOG            (*(volatile uint32_t *)(BOARD_PM_BASE + 0x24u))
+#define PM_PASSWORD        0x5A000000u
+#define PM_RSTC_FULL_RESET 0x00000020u
+
+void board_reboot(void) {
+    if (uart_ready()) {
+        uart_set_buffered(0);
+    }
+    PM_WDOG = PM_PASSWORD | 10u;     // about 150 us, in 16 us ticks
+    PM_RSTC = PM_PASSWORD | (PM_RSTC & ~0x30u) | PM_RSTC_FULL_RESET;
+    for (;;) {}
+}
+
 static const char *const fault_names[] = {
     "?", "undefined instruction", "SWI", "prefetch abort", "data abort", "reserved", "IRQ", "FIQ",
 };

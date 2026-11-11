@@ -59,21 +59,28 @@ set(PLATFORM_SRC startup.S board.c uart.c mbox.c bootcheck.c)
 # Each milestone is its own image. <target>.img is the raw image the GPU firmware loads at 0x8000.
 # The latest milestone (SDCARD_TARGET) is also staged as sdcard/kernel.img next to config.txt.
 set(SDCARD_TARGET pizero_z2)
+# An optional second argument names another linker script (the loader's); both INCLUDE pizero_sections.ld.
 function(pizero_image target)
+    set(ldscript pizero.ld)
+    if(ARGC GREATER 1)
+        set(ldscript ${ARGV1})
+    endif()
     target_compile_options(${target} PRIVATE ${COMMON_FLAGS} -O2 -g -std=c17 -Wall -Wextra)
-    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR})
+    target_include_directories(${target} PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_LIST_DIR}/loader)
     target_link_libraries(${target} PRIVATE bcm_peripherals)
     target_link_options(${target} PRIVATE
         ${CPU_FLAGS}
         -nostartfiles
         --specs=nano.specs
         --specs=nosys.specs
-        -T${CMAKE_CURRENT_LIST_DIR}/pizero.ld
+        -L${CMAKE_CURRENT_LIST_DIR}
+        -T${CMAKE_CURRENT_LIST_DIR}/${ldscript}
         -Wl,--gc-sections
         -Wl,--no-warn-rwx-segments
         -Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/${target}.map
     )
-    set_target_properties(${target} PROPERTIES SUFFIX ".elf" LINK_DEPENDS ${CMAKE_CURRENT_LIST_DIR}/pizero.ld)
+    set_target_properties(${target} PROPERTIES SUFFIX ".elf"
+        LINK_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/${ldscript};${CMAKE_CURRENT_LIST_DIR}/pizero_sections.ld")
     add_custom_command(TARGET ${target} POST_BUILD
         COMMAND ${CMAKE_OBJCOPY} -O binary $<TARGET_FILE:${target}> ${CMAKE_CURRENT_BINARY_DIR}/${target}.img
         COMMAND ${CMAKE_SIZE} $<TARGET_FILE:${target}>
@@ -151,3 +158,28 @@ add_executable(pizero_z2 ${PLATFORM_SRC} z2/main_z2.c z2/uac1_z2.c)
 target_include_directories(pizero_z2 PRIVATE ${CMAKE_CURRENT_LIST_DIR}/z2 ${DSPI_DIR})
 target_link_libraries(pizero_z2 PRIVATE dspi_descriptors_z2 tinyusb_z2)
 pizero_image(pizero_z2)
+
+# USB loader: the SD card's kernel.img once it is set up (sdcard-loader/), loaded at 32 MB. It receives
+# any image above over USB into 0x8000 and starts it (tools/pizero_load.py).
+add_library(tinyusb_loader STATIC
+    ${TUSB_DIR}/tusb.c
+    ${TUSB_DIR}/common/tusb_fifo.c
+    ${TUSB_DIR}/device/usbd.c
+    ${TUSB_DIR}/device/usbd_control.c
+    ${TUSB_DIR}/class/vendor/vendor_device.c
+    ${TUSB_DIR}/portable/synopsys/dwc2/dcd_dwc2.c
+    ${TUSB_DIR}/portable/synopsys/dwc2/dwc2_common.c
+)
+target_include_directories(tinyusb_loader PUBLIC ${TUSB_DIR} ${CMAKE_CURRENT_LIST_DIR}/loader)
+target_link_libraries(tinyusb_loader PUBLIC bcm_peripherals)
+target_compile_options(tinyusb_loader PRIVATE ${COMMON_FLAGS} -O2 -g -std=c17 -Wall)
+
+add_executable(pizero_loader ${PLATFORM_SRC} loader/main_loader.c loader/usb_descriptors.c)
+target_link_libraries(pizero_loader PRIVATE tinyusb_loader)
+pizero_image(pizero_loader pizero_loader.ld)
+add_custom_command(TARGET pizero_loader POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/sdcard-loader
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_BINARY_DIR}/pizero_loader.img ${CMAKE_CURRENT_BINARY_DIR}/sdcard-loader/kernel.img
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_CURRENT_LIST_DIR}/boot/config_loader.txt ${CMAKE_CURRENT_BINARY_DIR}/sdcard-loader/config.txt
+    VERBATIM
+)

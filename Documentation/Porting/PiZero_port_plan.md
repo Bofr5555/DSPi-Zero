@@ -98,6 +98,10 @@ Count isochronous OUT packets and bytes, and report them on the UART. Exercise s
 
 **Status (2026-11-11): Z3 passed on the Zero 2 W.** With a 1 kHz tone playing, the board received 1000.0 packets per second (192000 bytes per second, alt 1, 48 kHz), and the rate was 999.5 to 1000.5 after each of ten switches to BlackHole 2ch and back. There were no suspends, and feedback kept flowing at about 250 per second. Three DWC2 problems had to be fixed first: a hang when streaming restarted, frames lost to a blocking UART print, and feedback packets queued on the wrong frame parity. Counters are read over EP0 with a bench-only vendor request, so no UART is needed. Details are in `PiZero_Z0_bringup.md` section 12.
 
+### Loading builds over USB
+
+*Added: 2026-11-11.* The SD card now holds a USB loader instead of a milestone image. `tools/pizero_load.py` reboots a running image to the loader and sends the new build over USB, so no card swaps are needed. A round trip takes about 7 s. See `PiZero_Z0_bringup.md` section 13.
+
 ### Z4. DSPi base running on the received audio
 
 Bring in the RP2350 float pipeline, the vendor command dispatcher and bulk params. Add a new platform ID (`WIRE_PLATFORM` value to be chosen; the STM32 fork already uses 2). Drive the pipeline from the USB receive path. With no output hardware yet, pace consumption from the 1 MHz system timer so the buffer fill behaves the way it will with a real output.

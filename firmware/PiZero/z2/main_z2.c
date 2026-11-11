@@ -16,6 +16,7 @@
 #include "broadcom/interrupts.h"
 #include "broadcom/gen/vcmailbox.h"
 
+#include "loader_proto.h"
 #include "uac1_z2.h"
 #include "usb_descriptors.h"
 
@@ -47,6 +48,8 @@ void tud_resume_cb(void) {
     uac1_z2_stats.resumes++;
 }
 
+static volatile bool reboot_requested;
+
 // Bench-only vendor request, device recipient. 0x4F is unused by DSPi's command set (config.h).
 #define REQ_Z_GET_STATS 0x4F
 #define Z_STATS_MAGIC   0x5A33u     // "Z3"
@@ -65,6 +68,16 @@ typedef struct {
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
     static z_stats_reply_t reply;
+    // Back to the USB loader: acknowledge, then reset once the status stage is done.
+    if (req->bRequest == APP_REQ_REBOOT_TO_LOADER && req->bmRequestType_bit.direction == TUSB_DIR_OUT) {
+        if (stage == CONTROL_STAGE_SETUP) {
+            return tud_control_status(rhport, req);
+        }
+        if (stage == CONTROL_STAGE_ACK) {
+            reboot_requested = true;
+        }
+        return true;
+    }
     if (req->bRequest != REQ_Z_GET_STATS || req->bmRequestType_bit.direction != TUSB_DIR_IN) {
         return false;
     }
@@ -133,6 +146,11 @@ int main(void) {
         tud_int_handler(0);
         tud_task();
         uart_poll();
+        if (reboot_requested) {
+            tud_disconnect();
+            board_delay_us(50000);
+            board_reboot();
+        }
 
         uint32_t now = board_micros();
         uint32_t half_period = uac1_z2_alt() ? 125000u : 500000u;

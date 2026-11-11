@@ -1,0 +1,11 @@
+# Boot config for the USB loader card (loader/main_loader.c), for the Pi Zero, Zero W and Zero 2 W.
+kernel=kernel.img
+# The loader is linked for 32 MB (pizero_loader.ld), leaving 0x8000 for the images it receives.
+kernel_address=0x02000000
+# Our code programs the PL011 for 48 MHz before it can ask the mailbox.
+init_uart_clock=48000000
+enable_uart=1
+# bootcode.bin and start.elf print their own boot log on UART0 at 115200 before our code starts.
+uart_2ndstage=1
+# The Zero 2 W image is 32-bit. The first-generation Zero ignores this.
+arm_64bit=0
