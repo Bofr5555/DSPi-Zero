@@ -1,3 +1,4 @@
 [submodule "DSPi"]
 	path = DSPi
 	url = https://github.com/WeebLabs/DSPi.git
+	ignore = untracked
