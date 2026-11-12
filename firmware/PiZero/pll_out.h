@@ -33,6 +33,8 @@ typedef struct {
     uint32_t ctrl, frac, ana1, per, core, cm_plla, cm_lock, v3d_ctl, v3d_div, pcm_ctl, pcm_div;
     uint32_t fw_ctrl, fw_frac, fw_per, fw_cm_plla;
     uint32_t smi_ctl, smi_div, in_use, refused;     // phase 2: the SMI clock and who owns PLLA
+    int32_t trim_ppb;                               // phase 5
+    uint32_t trims;
 } pll_out_status_t;
 
 // For the SMI: selects a row now and returns true once plla_per runs at it. A move within the same PER
@@ -40,7 +42,8 @@ typedef struct {
 // SMI on PLLA. pll_out_smi_row() picks the row and CM_SMI divider for a rate, or returns PLL_ROW_COUNT.
 bool pll_out_select(uint32_t row);
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi);
-void pll_out_set_in_use(bool on);                   // the SMI runs from plla_per: bench moves that hold it are refused
+void pll_out_set_in_use(bool on);
+void pll_out_trim(int32_t ppb);     // live trim of every row's multiplier, kept across family moves                   // the SMI runs from plla_per: bench moves that hold it are refused
 
 // Settling capture: the SMI clock counted in back-to-back 1 ms windows, with PLLA moved to a row at the
 // start of window PLL_CAPTURE_PRE. Bench only: it blocks the main loop for the whole capture.

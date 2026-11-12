@@ -59,6 +59,7 @@ static volatile uint32_t pending_row = 0xFFFFFFFFu;
 static volatile uint32_t pending_mux = 0xFFFFFFFFu, pending_osc;
 static uint32_t write_us, count_start_us;
 static const row_t *active;
+static int32_t trim_ppb;     // applied to every row, kept across family moves
 static volatile uint32_t pending_capture = 0xFFFFFFFFu;
 static pll_out_capture_t cap;
 
@@ -99,6 +100,13 @@ static void write_multiplier(uint32_t ndiv, uint32_t frac) {
     wr(A2W_PLLA_CTRL, ctrl);
 }
 
+// The row's multiplier (NDIV.FRAC, 20 fractional bits) scaled by trim_ppb, rounded to one FRAC step.
+static uint32_t trimmed(const row_t *r) {
+    int64_t base = (int64_t)r->ndiv << 20 | r->frac;
+    int64_t d = base * trim_ppb;
+    return (uint32_t)(base + (d >= 0 ? d + 500000000 : d - 500000000) / 1000000000);
+}
+
 // A move between rows with the same PER divider, with the channel already running, is made live: the
 // PLL slews to the new rate and the channel keeps its clock. Anything else holds the channel.
 static bool needs_hold(uint32_t row) {
@@ -116,7 +124,8 @@ static void retune(uint32_t row) {
         write_multiplier(st.fw_ctrl & NDIV_MASK, st.fw_frac & FRAC_MASK);
         active = 0;
     } else {
-        write_multiplier(rows[row].ndiv, rows[row].frac);
+        uint32_t m = trimmed(&rows[row]);
+        write_multiplier(m >> 20, m & FRAC_MASK);
         active = &rows[row];
     }
     st.row = row;
@@ -230,6 +239,18 @@ bool pll_out_select(uint32_t row) {
         lock_wait_step(false);
     }
     return st.state == PLL_LOCKED;
+}
+
+// Phase 5: a live trim, FRAC (and NDIV when the fraction carries) only, with no hold, so the channel and
+// the SMI keep running. One FRAC step is about 0.016 ppm on the A rows and 0.02 ppm on the B rows.
+void pll_out_trim(int32_t ppb) {
+    trim_ppb = ppb;
+    st.trim_ppb = ppb;
+    st.trims++;
+    if (active && st.state == PLL_LOCKED) {
+        uint32_t m = trimmed(active);
+        write_multiplier(m >> 20, m & FRAC_MASK);
+    }
 }
 
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi) {

@@ -636,7 +636,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
     // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles, 4 puts the SMI on PLLA
-    // (wIndex 1) or PLLD (0), 5 captures settling into row wIndex & 0xFF over wIndex >> 8 windows. IN returns
+    // (wIndex 1) or PLLD (0), 5 captures settling into row wIndex & 0xFF over wIndex >> 8 windows, 6 trims PLLA by
+    // (int16)wIndex x 0.01 ppm. IN returns
     // the status, or with wValue 1 the settling capture.
     if (bench && req->bRequest == 0x46) {
         static pll_out_status_t pst;
@@ -660,6 +661,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
             pll_out_count_request(req->wIndex & 0xFFu, (gates ? gates : 1u) * 192000u);
         } else if (req->wValue == 5) {
             pll_out_capture_request(req->wIndex & 0xFFu, req->wIndex >> 8);
+        } else if (req->wValue == 6) {
+            pll_out_trim((int32_t)(int16_t)req->wIndex * 10);     // wIndex in units of 0.01 ppm
         } else if (req->wValue == 4) {
             smi_source_request = req->wIndex;
         } else {

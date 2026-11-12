@@ -395,3 +395,36 @@ The three means agree within 0.11 ppm, inside the 1 ppm criterion. As expected, 
 **USB hang.** The runs above exposed a hang of USB control transfers under rapid stream starts, stops and rate changes. It happened on PLLD with PLLA untouched as well, so it is not part of this work. It was caused by and fixed in the DWC2 driver; see `PiZero_Z0_bringup.md` section 21.
 
 **Verdict.** Phase 3 passes. Phase 4, jitter verification, needs an instrument and is recorded as not verified for now, as its pass criterion allows. Phase 5 (fine trim) is next.
+
+## 12. Phase 5 results (2026-11-12)
+
+Code:
+- **`pll_out_trim(ppb)`** scales the active row's multiplier (NDIV.FRAC) by the trim, rounded to one FRAC step, and writes it live with no hold, so the PER channel and the SMI keep running. The trim is kept across family moves, so it applies to whichever row is in use.
+- **Bench request** `0x46` op 6 sets the trim in 0.01 ppm units. `tools/pll_trim.py` runs the test while a tone streams straight to the Pi.
+- **Not yet connected** to anything that tracks an input clock.
+
+**Tracking.** These are measured on the SMI clock with the on-chip counter, against the reading at trim 0, which is 0.000 ppm from nominal at both rates.
+
+| Commanded | 48 kHz (b48) | 44.1 kHz (b44) |
+|---|---|---|
+| +0.02 ppm (about one FRAC step) | +0.068 | +0.000 |
+| +1 ppm | +1.017 | +0.960 |
+| +10 / -10 ppm | +10.037 / -9.969 | +9.965 / -9.965 |
+| +100 / -100 ppm | +100.030 / -99.962 | +100.018 / -100.018 |
+
+Every reading is within the counter's resolution of the command (0.07 ppm over 400 ms), far inside the 1 ppm criterion. A single FRAC step is below that resolution, so it is confirmed by the register readback rather than the frequency.
+
+**Staircase and jump.**
+- **Staircase:** 0 to +100 to -100 to 0 ppm in 1 ppm steps at 10 steps a second, about 40 s, with plateaus read every 50 ppm. FLOCKA never cleared, and `lock_lost` stayed 0.
+- **Jump:** 0 to +100 ppm in one write already reads +100 ppm in the first 10 ms window after it (one count is 2.7 ppm there).
+- **Slew limit:** no slew limit appears up to 100 ppm on the PLL side.
+
+**Stream.** The tone played through every run.
+- **Clean runs:** six of the seven runs at 48 and 44.1 kHz showed no composer lateness, slot underruns, ring drops, USB underruns or lost lock.
+- **One gap:** the first 44.1 kHz run, which came straight after the 48 kHz one, lost 4356 frames (about 99 ms) with one USB underrun. That run had no per-phase counters, so it is not known whether this happened during the trim or as macOS settled the rate change. It did not recur in five later 44.1 kHz runs, which had per-phase counters.
+
+**Not verified.**
+- **Receiver lock:** there is no S/PDIF receiver or DAC on the bench, so whether a receiver stays locked through the staircase and the jump is untested. The plan wanted this to set the slew limit for a tracking loop.
+- **Trimming off an integer:** the test ran on the B rows, which become fractional as soon as they are trimmed. That is the spur case section 8 warns about, and it can only be judged with an instrument (phase 4). A tracking loop should use the A rows.
+
+**Verdict.** Phase 5 passes on frequency, lock and the stream. Receiver lock is outstanding. Phase 6 (PLLA as the boot default, with the watchdog and PLLD fallback) is next.
