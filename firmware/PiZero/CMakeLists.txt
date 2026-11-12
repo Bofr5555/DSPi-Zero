@@ -235,10 +235,33 @@ if(PIZERO_BOARD STREQUAL "zero2")
         adat_output.c
         notify.c
         bg_job.c
+        vendor_commands.c
+        bulk_params.c
+        flash_storage.c
+        usb_feedback_controller.c
+        input_source_names.c
+        lg_sound_sync.c
+        dac_hw_mute.c
+        uart_control.c
+        i2c_control.c
+        control_surfaces.c
+        control_surfaces_display.c
+        control_surfaces_ir.c
+        control_surfaces_nouns.c
+        usb_descriptors.c
     )
     list(TRANSFORM Z4_DSPI_FILES PREPEND ${DSPI_DIR}/ OUTPUT_VARIABLE Z4_DSPI_SRC)
 
     add_library(dspi_z4 STATIC ${Z4_DSPI_SRC})
+    # build_info.h (REQ_GET_BUILD_INFO), stamped by DSPi's own script on every build, as DSPi does.
+    set(Z4_GENERATED_DIR ${CMAKE_CURRENT_BINARY_DIR}/z4_generated)
+    add_custom_target(dspi_z4_build_info
+        COMMAND ${CMAKE_COMMAND} -DREPO_DIR=${DSPI_DIR} -DOUT_FILE=${Z4_GENERATED_DIR}/build_info.h
+            -P ${DSPI_DIR}/../../scripts/gen_build_info.cmake
+        BYPRODUCTS ${Z4_GENERATED_DIR}/build_info.h
+        VERBATIM)
+    add_dependencies(dspi_z4 dspi_z4_build_info)
+    target_include_directories(dspi_z4 PRIVATE ${Z4_GENERATED_DIR})
     # uac2 first for its tusb_config.h, then the shim, then DSPi and the real pico-extras output headers.
     target_include_directories(dspi_z4 BEFORE PUBLIC ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_include_directories(dspi_z4 PUBLIC
@@ -246,6 +269,8 @@ if(PIZERO_BOARD STREQUAL "zero2")
         ${PICO_EXTRAS_DIR}/pico_audio_spdif_multi/include
         ${PICO_EXTRAS_DIR}/pico_audio_i2s_multi/include
     )
+    # This also makes vendor requests report WIRE_PLATFORM_RP2350 (1), so an unpatched DSPi Console
+    # connects. Temporary, until the Zero gets its own platform ID.
     target_compile_definitions(dspi_z4 PUBLIC PICO_RP2350=1)
     target_link_libraries(dspi_z4 PUBLIC tinyusb_uac2)
     # DSPi builds hosted (so fabsf, fminf and the like are builtins), with -fcommon and gnu C. Its
@@ -260,14 +285,32 @@ if(PIZERO_BOARD STREQUAL "zero2")
         set_property(SOURCE ${DSPI_DIR}/${f} APPEND PROPERTY COMPILE_OPTIONS -O3 -ffp-contract=off)
     endforeach()
     # usb_audio.c holds the pipeline's globals and usb_sound_card_init(), and also DSPi's UAC1 class
-    # driver. Its driver hook is renamed so the image keeps its own vendor driver, and its tud_init()
-    # becomes a no-op because main_z4.c brings USB up itself.
+    # driver. Its driver hook is renamed so the image keeps its own vendor driver, its tud_init()
+    # becomes a no-op because main_z4.c brings USB up itself, and main_z4.c answers
+    # usb_audio_stream_active() from the UAC2 consumer.
     set_property(SOURCE ${DSPI_DIR}/usb_audio.c APPEND PROPERTY COMPILE_DEFINITIONS
         usbd_app_driver_get_cb=dspi_uac1_driver_get_cb
         tud_rhport_init=dspi_z4_tud_rhport_init
+        usb_audio_stream_active=dspi_uac1_stream_active
     )
 
-    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c z4/main_z4.c z4/z4_globals.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
+    # vendor_commands.c answers every vendor request on EP0. Its entry point is renamed so main_z4.c's
+    # callback can serve the bench requests (0x4F, 0x40) first and pass everything else on.
+    set_property(SOURCE ${DSPI_DIR}/vendor_commands.c APPEND PROPERTY COMPILE_DEFINITIONS
+        tud_vendor_control_xfer_cb=dspi_vendor_control_xfer_cb
+    )
+
+    # usb_descriptors.c is linked only for its serial string buffer and MS OS 2.0 descriptor set, which
+    # vendor_commands.c returns. The image enumerates with uac2's descriptors, so DSPi's callbacks are
+    # renamed out of the way and dropped by the linker.
+    set_property(SOURCE ${DSPI_DIR}/usb_descriptors.c APPEND PROPERTY COMPILE_DEFINITIONS
+        tud_descriptor_bos_cb=dspi_tud_descriptor_bos_cb
+        tud_descriptor_device_cb=dspi_tud_descriptor_device_cb
+        tud_descriptor_configuration_cb=dspi_tud_descriptor_configuration_cb
+        tud_descriptor_string_cb=dspi_tud_descriptor_string_cb
+    )
+
+    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c z4/main_z4.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
     target_include_directories(pizero_z4 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_link_libraries(pizero_z4 PRIVATE dspi_z4 tinyusb_uac2)
     pizero_image(pizero_z4)

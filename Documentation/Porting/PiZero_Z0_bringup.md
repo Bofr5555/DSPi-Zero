@@ -436,3 +436,47 @@ The 40 underruns outside the windows come at stream edges, as the FIFO drains af
 - **The bug.** `db_to_vol[]` (`usb_audio.c:480`) is `uint16_t`, and its last entry, for 0 dB, is `0x8000`. `audio_set_volume()` stores it into `int16_t audio_state.vol_mul` (`usb_audio.c:510`, `usb_audio.h:21`), which makes it -32768. The pipeline scales `vol_mul` by 1/32768 (`audio_pipeline.c:348`).
 - **The effect.** At 0 dB host volume the gain would be -1.0, which inverts polarity, and the ramp from the 59 to the 60 step would pass through zero.
 - **Scope.** It would affect the RP boards too.
+
+## 16. Z4b: DSPi's control plane, the D-cache, and Console
+
+*Added: 2026-11-12*
+
+`pizero_z4.img` now runs DSPi's control plane as well as its pipeline.
+
+**DSPi files added unchanged.** These are `vendor_commands`, `bulk_params`, `flash_storage`, `usb_feedback_controller`, `input_source_names`, `lg_sound_sync`, `dac_hw_mute`, `uart_control`, `i2c_control`, `control_surfaces` (with `_display`, `_ir` and `_nouns`) and `usb_descriptors`. `usb_descriptors.c` is linked only for `desc_ms_os_20` and the serial string. Its descriptor callbacks are renamed, because the UAC2 descriptors are the ones in use.
+
+**How requests and state are handled.**
+
+- **Vendor requests.** `z4/main_z4.c` answers its own bench requests, then passes every other vendor request at every stage to DSPi's handler (renamed `dspi_vendor_control_xfer_cb`). The bench requests are `0x4F` stats and `0x40` reboot to loader, and only when sent to the device recipient. DSPi Console and DSPi's test harness address interface 2, so for them those codes stall as on an RP2350.
+- **Main-loop handlers.** `z4/z4_mainloop.c` ports DSPi's `main.c` handlers for the pending flags that vendor commands set, calling DSPi's own functions, gated the same way. That covers bulk params, EQ recompute, rate change, presets, factory reset, output config, dynamics coefficients and background jobs. Hardware-only work is stubbed in `z4/dspi_standins.c`. S/PDIF, ADAT and I2S inputs never lock. Control-surface and UART/I2C bindings are configurable but never act. The ADAT output never starts.
+- **Presets.** Presets live in a 128 KB RAM window that stands in for the top of a 4 MB flash part, with NOR erase and program rules. They are lost at reboot until SD storage exists.
+- **Notifications.** The vendor app driver drains them to EP `0x83`, using the same claim, peek, transfer and commit sequence as DSPi's `usb_notify_drain`, with a 1-byte keep-alive after 100 ms.
+
+**MMU and D-cache** (`caches_v7.c`, `mmu.h`).
+
+- **The map.** `mmu_enable()` identity-maps SDRAM below `0x3F000000` as Normal write-back write-allocate memory, in 1 MB sections. The peripherals and the ARM local block are Device and execute-never. It invalidates the data caches by set/way before turning on M, C, I and Z, with alignment checking off.
+- **Cache maintenance.** `data_clean()` and `data_invalidate()` are now real (DCCMVAC/DCCIMVAC, 64-byte lines). `mbox_call()` uses them, because the GPU reads the buffer from SDRAM. USB slave mode uses no DMA, so nothing else needs maintenance.
+- **Effect.** With the cache on, a DSP block takes 44.6 us on average and 59 us at most for 48 frames, against 340 to 420 us with it off. `cpu0_load` fell from 35 to 62% to 4%. The higher figure was after the control plane went in, which also cost about 3.5% of packets.
+- **Spurious IRQs.** The faster handler returned before the USB controller's interrupt-clear writes landed, so `usb_irq()` now reads `GINTSTS` back before returning.
+
+**Platform identity and System Information.**
+
+- **Board byte.** A `GET_PLATFORM` request for 8 or more bytes gets DSPi's 7 bytes plus byte 7 = `1`, which means Raspberry Pi Zero 2 W. Byte 0 stays RP2350, the code base every Console feature gate uses. A 7-byte request still goes to DSPi unchanged. DSPi Console (`StatsView.swift`) asks for 8 bytes and shows the board name in Device Information. Its `platformName` gating is unchanged.
+- **Sensor readings.** `GET_STATUS` 13, 14 and 16 return the VideoCore's measured ARM clock, core voltage (tag `0x00030003`, id 1) and SoC temperature (tag `0x00030006`). The main loop caches them once a second, because a mailbox round trip is too slow for a control request. Measured values were 1000000000 Hz, 1256 mV and 36.48 °C.
+
+**DSPi Console** found the board on its own and polled it at about 36 requests a second with none stalled.
+
+**DSPi's control-plane harness** (`python3.14 -m tools.dspi_test.run`, no flash tests) passed 110 of 138 tests, with 12 failures, 0 errors and 16 skipped, over 2805 GETs and 1249 SETs. That run had the D-cache off, and the harness restored the state byte for byte. The failures broke down as follows:
+
+| Failures | Cause |
+|---|---|
+| 1 | The bench `0x4F` answered an interface request. Fixed since. |
+| 4 | GPIO 12 is not rejected as on an RP2350, because pin rules differ. Expected. |
+| 1 | Core 1 modes stay off in this single-core build. Expected. |
+| 1 | Clock diagnostics answer zero-length, as release RP2350 builds do. Part of the read-everything test. |
+| 2 | Stale test expectations. The subharmonic headroom (4.14 dB, `subharm.c:499-546`) and the tube drive floor (-30 dB, `tube.h:42`) match DSPi's current code, so an RP2350 fails these the same way. |
+| 1 | The RTA config validation does not stall over USB. DSPi deliberately acknowledges a rejected SET on USB (`vendor_commands.c:4629-4634`). |
+| 1 | RTA busy time over budget, measured with the D-cache off. |
+| 1 | The RTA did not auto-stop, most likely because Console's spectrum view was reading the analyser at the same time. |
+
+A rerun with the D-cache on and Console closed is still to do.

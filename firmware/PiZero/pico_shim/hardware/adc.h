@@ -2,7 +2,10 @@
 
 #include "pico.h"
 
-// No ADC on the Pi. Reads return 0, which DSPi's temperature conversion turns into a fixed value.
+// No ADC on the Pi. The temperature sensor input (the last one, as on the RP2350A) reads a fixed
+// code for 27 C; every other input reads 0.
+#define NUM_ADC_CHANNELS 5
+#define ADC_TEMPERATURE_CHANNEL_NUM (NUM_ADC_CHANNELS - 1)
 void adc_init(void);
 void adc_gpio_init(uint gpio);
 void adc_select_input(uint input);

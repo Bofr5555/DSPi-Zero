@@ -14,17 +14,25 @@
 #include "hardware/adc.h"
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
+#include "hardware/flash.h"
 #include "hardware/gpio.h"
+#include "hardware/i2c.h"
 #include "hardware/irq.h"
 #include "hardware/pio.h"
+#include "hardware/pwm.h"
+#include "hardware/structs/nvic.h"
 #include "hardware/sync.h"
 #include "hardware/vreg.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
+#include "pico/i2c_slave.h"
 
 #include "board.h"
 #include "mbox.h"
 #include "uart.h"
+
+// After the Pi's uart.h: this one renames the SDK's uart_init.
+#include "hardware/uart.h"
 
 #include "broadcom/defines.h"
 
@@ -54,6 +62,23 @@ void panic(const char *fmt, ...) {
 
 void panic_unsupported(void) {
     panic("unsupported");
+}
+
+// A failed assert in DSPi or the SDK shim stops with the panic LED pattern instead of newlib's abort().
+void __assert_func(const char *file, int line, const char *func, const char *expr) {
+    (void)func;
+    panic("assert %s at %s:%d", expr, file, line);
+}
+
+// stdout and stderr go to the bring-up UART, so DSPi's printf diagnostics appear in the log.
+int _write(int fd, const char *buf, int len) {
+    (void)fd;
+    if (uart_ready()) {
+        for (int i = 0; i < len; i++) {
+            uart_putc(buf[i]);      // adds the CR before each LF
+        }
+    }
+    return len;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -483,8 +508,11 @@ uint adc_get_selected_input(void) {
 void adc_set_temp_sensor_enabled(bool enable) {
     (void)enable;
 }
+// The sensor's code for 27 C: 0.706 V on a 3.3 V, 12-bit scale.
+#define ADC_TEMP_27C_CODE 876u
+
 uint16_t adc_read(void) {
-    return 0;
+    return adc_input == ADC_TEMPERATURE_CHANNEL_NUM ? ADC_TEMP_27C_CODE : 0;
 }
 void adc_set_round_robin(uint input_mask) {
     (void)input_mask;
@@ -573,6 +601,128 @@ void pico_get_unique_board_id_string(char *id_out, uint len) {
 
 bool stdio_init_all(void) {
     return true;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Flash: a RAM window over the top of a 4 MB part (see hardware/flash.h)
+
+uint8_t pico_shim_flash_window[PICO_SHIM_FLASH_WINDOW_BYTES] __attribute__((aligned(FLASH_SECTOR_SIZE)));
+nvic_hw_t pico_shim_nvic_hw;
+
+static uint8_t *flash_window_ptr(uint32_t flash_offs, size_t count) {
+    const uint32_t base = PICO_FLASH_SIZE_BYTES - PICO_SHIM_FLASH_WINDOW_BYTES;
+    if (flash_offs < base || count > PICO_FLASH_SIZE_BYTES - flash_offs) {
+        panic("flash 0x%lx+%u outside the RAM window", (unsigned long)flash_offs, (unsigned)count);
+    }
+    return &pico_shim_flash_window[flash_offs - base];
+}
+
+void pico_shim_flash_init(void) {
+    memset(pico_shim_flash_window, 0xff, sizeof(pico_shim_flash_window));
+}
+
+void flash_range_erase(uint32_t flash_offs, size_t count) {
+    if ((flash_offs | count) & (FLASH_SECTOR_SIZE - 1u)) {
+        panic("flash erase not sector aligned");
+    }
+    memset(flash_window_ptr(flash_offs, count), 0xff, count);
+}
+
+void flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
+    if ((flash_offs | count) & (FLASH_PAGE_SIZE - 1u)) {
+        panic("flash program not page aligned");
+    }
+    uint8_t *dst = flash_window_ptr(flash_offs, count);
+    for (size_t i = 0; i < count; i++) {
+        dst[i] &= data[i];      // programming only clears bits
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// UART, I2C, PWM and GPIO edge interrupts: Control Surfaces and the UART/I2C control interfaces
+
+uart_hw_t pico_shim_uart_hw[2];
+i2c_hw_t pico_shim_i2c_hw[2];
+
+uint uart_init(uart_inst_t *uart, uint baudrate) {
+    (void)uart;
+    return baudrate;
+}
+void uart_deinit(uart_inst_t *uart) {
+    (void)uart;
+}
+uint uart_set_baudrate(uart_inst_t *uart, uint baudrate) {
+    (void)uart;
+    return baudrate;
+}
+void uart_set_format(uart_inst_t *uart, uint data_bits, uint stop_bits, uart_parity_t parity) {
+    (void)uart, (void)data_bits, (void)stop_bits, (void)parity;
+}
+void uart_set_hw_flow(uart_inst_t *uart, bool cts, bool rts) {
+    (void)uart, (void)cts, (void)rts;
+}
+void uart_set_fifo_enabled(uart_inst_t *uart, bool enabled) {
+    (void)uart, (void)enabled;
+}
+void uart_set_irq_enables(uart_inst_t *uart, bool rx_has_data, bool tx_needs_data) {
+    (void)uart, (void)rx_has_data, (void)tx_needs_data;
+}
+bool uart_is_readable(uart_inst_t *uart) {
+    (void)uart;
+    return false;
+}
+bool uart_is_writable(uart_inst_t *uart) {
+    (void)uart;
+    return true;    // bytes written go nowhere
+}
+
+uint i2c_init(i2c_inst_t *i2c, uint baudrate) {
+    (void)i2c;
+    return baudrate;
+}
+void i2c_deinit(i2c_inst_t *i2c) {
+    (void)i2c;
+}
+size_t i2c_get_write_available(i2c_inst_t *i2c) {
+    (void)i2c;
+    return 0;
+}
+size_t i2c_get_read_available(i2c_inst_t *i2c) {
+    (void)i2c;
+    return 0;
+}
+uint8_t i2c_read_byte_raw(i2c_inst_t *i2c) {
+    (void)i2c;
+    return 0;
+}
+void i2c_write_byte_raw(i2c_inst_t *i2c, uint8_t value) {
+    (void)i2c, (void)value;
+}
+void i2c_slave_init(i2c_inst_t *i2c, uint8_t address, i2c_slave_handler_t handler) {
+    (void)i2c, (void)address, (void)handler;
+}
+void i2c_slave_deinit(i2c_inst_t *i2c) {
+    (void)i2c;
+}
+
+void pwm_set_wrap(uint slice_num, uint16_t wrap) {
+    (void)slice_num, (void)wrap;
+}
+void pwm_set_clkdiv(uint slice_num, float divider) {
+    (void)slice_num, (void)divider;
+}
+void pwm_set_gpio_level(uint gpio, uint16_t level) {
+    (void)gpio, (void)level;
+}
+void pwm_set_enabled(uint slice_num, bool enabled) {
+    (void)slice_num, (void)enabled;
+}
+
+void gpio_set_irq_enabled(uint gpio, uint32_t event_mask, bool enabled) {
+    (void)gpio, (void)event_mask, (void)enabled;
+}
+void gpio_acknowledge_irq(uint gpio, uint32_t event_mask) {
+    (void)gpio, (void)event_mask;
 }
 
 // ---------------------------------------------------------------------------------------------------

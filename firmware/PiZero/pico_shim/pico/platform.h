@@ -54,6 +54,15 @@ static inline uint get_core_num(void) {
     return 0;
 }
 
+// The SDK returns the active exception number, 0 in thread mode. Here: 0 in the system (or user)
+// mode the main loop runs in, otherwise the CPSR mode bits, which are never 0.
+static inline uint __get_current_exception(void) {
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr" : "=r"(cpsr));
+    uint32_t mode = cpsr & 0x1fu;
+    return (mode == 0x1fu || mode == 0x10u) ? 0u : mode;
+}
+
 // Prints the message on the UART and stops with the fault LED pattern.
 void panic(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 void panic_unsupported(void) __attribute__((noreturn));

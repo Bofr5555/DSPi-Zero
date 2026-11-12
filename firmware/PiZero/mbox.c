@@ -3,6 +3,7 @@
 #include <stdbool.h>
 
 #include "board.h"
+#include "broadcom/caches.h"
 #include "broadcom/cpu.h"
 #include "broadcom/defines.h"
 #include "broadcom/gen/vcmailbox.h"
@@ -42,6 +43,7 @@ static bool mbox_call(uint32_t timeout_us) {
         (void)VCMAILBOX->READ;
     }
     COMPLETE_MEMORY_READS;
+    data_clean(mbox_buf, sizeof(mbox_buf));     // the GPU reads it from SDRAM, not the ARM's cache
     VCMAILBOX->WRITE = msg;
 
     for (;;) {
@@ -54,6 +56,7 @@ static bool mbox_call(uint32_t timeout_us) {
         }
         if (VCMAILBOX->READ == msg) {
             COMPLETE_MEMORY_READS;
+            data_invalidate(mbox_buf, sizeof(mbox_buf));
             if (mbox_buf[1] != VCMAILBOX_CODE_REQUEST_SUCCESSFUL) {
                 last_error = 3;
                 return false;
@@ -117,6 +120,16 @@ uint32_t mbox_clock_rate_measured(uint32_t clock_id) {
 uint32_t mbox_board_revision(void) {
     volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_GET_BOARD_REVISION, 4, 0, 0);
     return v ? v[0] : 0;
+}
+
+uint32_t mbox_voltage_uv(uint32_t voltage_id) {
+    volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_GET_VOLTAGE, 8, voltage_id, 0);
+    return v ? v[1] : 0;
+}
+
+uint32_t mbox_temperature_mc(void) {
+    volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_GET_TEMPERATURE, 8, 0, 0);
+    return v ? v[1] : 0;
 }
 
 uint64_t mbox_board_serial(void) {

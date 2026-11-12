@@ -1,7 +1,7 @@
-// Z4a: DSPi's RP2350 float pipeline running on audio received by the UAC2 High Speed front end.
-// Every millisecond the rate's worth of frames is taken from TinyUSB's FIFO, decoded into DSPi's input
-// buffers and run through process_input_block(). The output slot rings are drained by the system timer
-// (pico_shim.c), standing in for the outputs. Counters are read with vendor request 0x4F.
+// Z4: DSPi on the UAC2 High Speed front end. Every millisecond the rate's worth of frames is taken from
+// TinyUSB's FIFO and run through DSPi's process_input_block(); the output rings are drained by the system
+// timer (pico_shim.c). Vendor requests go to DSPi's vendor_commands.c, notifications go out on EP 0x83,
+// and z4_mainloop.c carries DSPi's main-loop work. Bench counters are read with vendor request 0x4F.
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -9,6 +9,7 @@
 #include <string.h>
 
 #include "board.h"
+#include "mmu.h"
 #include "irq.h"
 #include "mbox.h"
 #include "uart.h"
@@ -28,24 +29,15 @@
 #include "pico/time.h"
 
 #include "config.h"
-#include "adat_output.h"
 #include "audio_input.h"
 #include "audio_pipeline.h"
-#include "crossfeed.h"
-#include "dsp_pipeline.h"
-#include "flash_storage.h"
-#include "leveller.h"
-#include "limiter.h"
-#include "loudness.h"
+#include "notify.h"
 #include "output_latency.h"
 #include "pdm_generator.h"
-#include "psybass.h"
-#include "rta.h"
-#include "subharm.h"
-#include "tube.h"
-#include "upmix.h"
+#include "siggen.h"
 #include "usb_audio.h"
 
+#include "z4.h"
 #include "z4_globals.h"
 
 uint32_t tusb_time_millis_api(void) {
@@ -54,6 +46,9 @@ uint32_t tusb_time_millis_api(void) {
 
 static void usb_irq(void) {
     tud_int_handler(0);
+    // Read back from the controller so its interrupt-clear writes have landed before we return.
+    // Otherwise the line is still high and the IRQ fires again with nothing pending.
+    (void)*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + 0x014);    // GINTSTS
 }
 
 // usb_sound_card_init() in DSPi's usb_audio.c calls tud_init(), whose tud_rhport_init() is renamed to
@@ -126,6 +121,10 @@ typedef struct {
     uint32_t slot0_underrun_frames; // silence frames skipped into slot 0 by recovery
     uint32_t slot0_drop_frames;     // frames slot 0 refused (should stay 0)
     uint32_t pipeline_rate;         // audio_state.freq
+    uint32_t vendor_requests;       // vendor requests DSPi accepted (SETUP stage), version 3
+    uint32_t vendor_stalls;         // vendor requests DSPi stalled
+    uint32_t notify_packets;        // event packets sent on EP 0x83
+    uint32_t notify_keepalives;     // 1-byte idle packets sent on EP 0x83
 } z4_stats_t;
 
 int8_t dcd_dwc2_iso_parity(uint8_t dir, uint8_t epnum);
@@ -136,6 +135,8 @@ static volatile bool reboot_requested;
 
 static uint32_t dspi_blocks, dspi_frames, dspi_us_last, dspi_us_max;
 static uint64_t dspi_us_total;
+static uint32_t vendor_requests, vendor_stalls, notify_packets, notify_keepalives;
+static volatile bool consumer_running;
 
 void tud_mount_cb(void) {
     stats.mounts++;
@@ -316,6 +317,51 @@ void tud_audio_fb_done_cb(uint8_t func_id) {
 // ---------------------------------------------------------------------------------------------------
 // Vendor interface (DSPi Console's channel) and bench requests
 
+// ---------------------------------------------------------------------------------------------------
+// Notifications: usb_notify_drain() from DSPi's usb_audio.c, on this driver's EP 0x83. Events go out
+// as soon as they are queued; with none, a 1-byte idle packet after 100 ms of quiet. Each packet is
+// at most 64 bytes, a short packet on this 512-byte High Speed bulk endpoint, so each ends a transfer.
+
+#define NOTIFY_IDLE_KEEPALIVE_US 100000u
+#define Z4_NOTIFY_MAX_PKT 64u
+
+static uint8_t notify_buf[Z4_NOTIFY_MAX_PKT] __attribute__((aligned(4)));
+static bool notify_ep_open;
+static uint32_t notify_last_arm_us;
+
+static void notify_drain(uint8_t rhport) {
+    if (!notify_ep_open) {
+        return;
+    }
+    if (!notify_has_pending_for(NOTIFY_CONSUMER_USB) &&
+        (uint32_t)(time_us_32() - notify_last_arm_us) < NOTIFY_IDLE_KEEPALIVE_US) {
+        return;
+    }
+    if (!usbd_edpt_claim(rhport, EP_NOTIFY_IN)) {
+        return;     // busy: the completion re-arms
+    }
+    uint16_t len = 0;
+    if (notify_has_pending_for(NOTIFY_CONSUMER_USB)) {
+        len = notify_peek_next_for(NOTIFY_CONSUMER_USB, notify_buf, Z4_NOTIFY_MAX_PKT);
+    }
+    bool event = len > 0;
+    if (!event) {
+        notify_buf[0] = 0x00;
+        len = 1;
+    }
+    if (!usbd_edpt_xfer(rhport, EP_NOTIFY_IN, notify_buf, len)) {
+        usbd_edpt_release(rhport, EP_NOTIFY_IN);
+        return;     // the same event is retried next pass
+    }
+    notify_last_arm_us = time_us_32();
+    if (event) {
+        notify_commit_pop_for(NOTIFY_CONSUMER_USB);
+        notify_packets++;
+    } else {
+        notify_keepalives++;
+    }
+}
+
 static uint16_t vendor_open(uint8_t rhport, tusb_desc_interface_t const *itf, uint16_t max_len) {
     if (itf->bInterfaceClass != TUSB_CLASS_VENDOR_SPECIFIC) {
         return 0;
@@ -324,7 +370,11 @@ static uint16_t vendor_open(uint8_t rhport, tusb_desc_interface_t const *itf, ui
     uint8_t const *p = (uint8_t const *)itf + len;
     for (uint8_t i = 0; i < itf->bNumEndpoints && len < max_len; i++) {
         if (tu_desc_type(p) == TUSB_DESC_ENDPOINT) {
-            TU_ASSERT(usbd_edpt_open(rhport, (tusb_desc_endpoint_t const *)p), 0);
+            tusb_desc_endpoint_t const *ep = (tusb_desc_endpoint_t const *)p;
+            TU_ASSERT(usbd_edpt_open(rhport, ep), 0);
+            if (ep->bEndpointAddress == EP_NOTIFY_IN) {
+                notify_ep_open = true;
+            }
         }
         len += tu_desc_len(p);
         p += tu_desc_len(p);
@@ -342,10 +392,13 @@ static bool vendor_control(uint8_t rhport, uint8_t stage, tusb_control_request_t
 }
 
 static bool vendor_xfer(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint32_t xferred_bytes) {
-    (void)rhport;
     (void)result;
     (void)xferred_bytes;
-    return ep_addr == EP_NOTIFY_IN;
+    if (ep_addr != EP_NOTIFY_IN) {
+        return false;
+    }
+    notify_drain(rhport);   // delivered: send the next one, if any
+    return true;
 }
 
 static void vendor_noop(void) {}
@@ -354,8 +407,12 @@ static bool vendor_deinit(void) {
     return true;
 }
 
+// Bus reset, as DSPi's UAC1 driver handles it: queued notifications are stale.
 static void vendor_reset(uint8_t rhport) {
     (void)rhport;
+    notify_ep_open = false;
+    notify_reset_queue();
+    notify_master_vol_host_initiated = false;
 }
 
 static const usbd_class_driver_t vendor_driver = {
@@ -375,6 +432,7 @@ usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
 }
 
 #define REQ_Z_GET_STATS 0x4F
+#define BOARD_ID_PI_ZERO_2W 1   // GET_PLATFORM byte 7, matched by DSPi Console's Constants.swift
 #define U2_STATS_MAGIC  0x5532u     // "U2"
 
 typedef struct {
@@ -387,13 +445,13 @@ typedef struct {
     uint8_t speed;      // tusb_speed_t: 0 full, 2 high
     uint8_t reserved;
     u2_stats_t stats;
-    z4_stats_t dspi;    // version 2
+    z4_stats_t dspi;    // version 2, grown in version 3
 } u2_reply_t;
 
 // Wire layout read by the bench tools: version 1 fields unchanged, the DSPi block appended.
 _Static_assert(offsetof(u2_reply_t, dspi) == 116, "0x4F reply: DSPi block offset");
 _Static_assert(offsetof(z4_stats_t, peaks) == 28 && offsetof(z4_stats_t, slot0_fill) == 64, "0x4F reply layout");
-_Static_assert(sizeof(u2_reply_t) == 204, "0x4F reply size");
+_Static_assert(sizeof(u2_reply_t) == 220, "0x4F reply size");
 
 static void fill_dspi_stats(z4_stats_t *z) {
     memset(z, 0, sizeof(*z));
@@ -423,12 +481,40 @@ static void fill_dspi_stats(z4_stats_t *z) {
         z->slot0_drop_frames = inst ? inst->drop_frames : 0;
     }
     z->pipeline_rate = audio_state.freq;
+    z->vendor_requests = vendor_requests;
+    z->vendor_stalls = vendor_stalls;
+    z->notify_packets = notify_packets;
+    z->notify_keepalives = notify_keepalives;
+}
+
+bool dspi_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req);
+
+// VideoCore sensor readings for DSPi Console's System Information, refreshed once a second from the
+// main loop because a mailbox round trip is too slow for a control request.
+static volatile uint32_t sensor_arm_hz, sensor_core_mv;
+static volatile int32_t sensor_temp_cc;
+
+static void sensors_refresh(void) {
+    static uint32_t last_us;
+    static bool primed;
+    uint32_t now = board_micros();
+    if (primed && now - last_us < 1000000u) {
+        return;
+    }
+    primed = true;
+    last_us = now;
+    sensor_arm_hz = mbox_clock_rate_measured(VCMAILBOX_CLOCK_ARM);
+    sensor_core_mv = (mbox_voltage_uv(1) + 500u) / 1000u;
+    sensor_temp_cc = (int32_t)(mbox_temperature_mc() + 5u) / 10;
 }
 
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
     static u2_reply_t reply;
     bool in = req->bmRequestType_bit.direction == TUSB_DIR_IN;
-    if (req->bRequest == APP_REQ_REBOOT_TO_LOADER && !in) {
+    // Bench requests are answered only when sent to the device. DSPi Console and its test harness
+    // address the vendor interface, so for them these codes stay unknown and stall, as on an RP2350.
+    bool bench = req->bmRequestType_bit.recipient == TUSB_REQ_RCPT_DEVICE;
+    if (bench && req->bRequest == APP_REQ_REBOOT_TO_LOADER && !in) {
         if (stage == CONTROL_STAGE_SETUP) {
             return tud_control_status(rhport, req);
         }
@@ -437,12 +523,12 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         return true;
     }
-    if (req->bRequest == REQ_Z_GET_STATS && in) {
+    if (bench && req->bRequest == REQ_Z_GET_STATS && in) {
         if (stage != CONTROL_STAGE_SETUP) {
             return true;
         }
         reply.magic = U2_STATS_MAGIC;
-        reply.version = 2;
+        reply.version = 3;
         reply.uptime_ms = board_micros() / 1000u;
         reply.rate = current_rate;
         reply.alt = current_alt;
@@ -464,171 +550,48 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         uint16_t len = req->wLength < sizeof(reply) ? req->wLength : (uint16_t)sizeof(reply);
         return tud_control_xfer(rhport, req, &reply, len);
     }
-    return false;
-}
-
-// ---------------------------------------------------------------------------------------------------
-// DSPi bring-up and the deferred work its main loop would do
-
-// Stop every set-up slot, reset its ring and start them all together, then hold the pipeline muted
-// until the rings have refilled, as main.c's complete_pipeline_reset() does for USB.
-static void restart_outputs(void) {
-    audio_spdif_instance_t *spdif_sync[NUM_SPDIF_INSTANCES];
-    audio_i2s_instance_t *i2s_sync[NUM_SPDIF_INSTANCES];
-    uint spdif_count = 0, i2s_count = 0;
-    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
-        if (output_types[i] == OUTPUT_TYPE_I2S) {
-            audio_i2s_instance_t *inst = i2s_instance_ptrs[i];
-            if (inst && inst->ring) {
-                audio_i2s_set_enabled(inst, false);
-                audio_i2s_ring_reset(inst);
-                i2s_sync[i2s_count++] = inst;
-            }
+    // GET_PLATFORM for 8 or more bytes: DSPi's 7-byte reply plus a board byte that DSPi Console shows
+    // in Device Information. Byte 0 stays RP2350, the code base, which every feature gate uses, so a
+    // Console that asks for 7 bytes (or predates the board byte) sees an RP2350 as before.
+    if (!bench && req->bRequest == REQ_GET_PLATFORM && in && req->wLength >= 8) {
+        static uint8_t platform_reply[8];
+        if (stage == CONTROL_STAGE_SETUP) {
+            platform_reply[0] = PLATFORM_RP2350;
+            platform_reply[1] = (uint8_t)(FW_VERSION_PACKED >> 8);
+            platform_reply[2] = (uint8_t)(FW_VERSION_PACKED & 0xFF);
+            platform_reply[3] = NUM_OUTPUT_CHANNELS;
+            platform_reply[4] = FW_VERSION_MINOR;
+            platform_reply[5] = FW_VERSION_PATCH;
+            platform_reply[6] = FW_VERSION_BETA;
+            platform_reply[7] = BOARD_ID_PI_ZERO_2W;
+            vendor_requests++;
+            return tud_control_xfer(rhport, req, platform_reply, sizeof(platform_reply));
+        }
+        return true;
+    }
+    // GET_STATUS 13, 14 and 16 (clock, core voltage, temperature) come from the VideoCore, not DSPi's
+    // RP2350 clock tree, regulator table and ADC formula. Values are cached by sensors_refresh().
+    if (!bench && req->bRequest == REQ_GET_STATUS && in &&
+        (req->wValue == 13 || req->wValue == 14 || req->wValue == 16)) {
+        static uint32_t sensor_reply;
+        if (stage == CONTROL_STAGE_SETUP) {
+            sensor_reply = req->wValue == 13 ? sensor_arm_hz : req->wValue == 14 ? sensor_core_mv : (uint32_t)sensor_temp_cc;
+            vendor_requests++;
+            uint16_t len = req->wLength < 4 ? req->wLength : 4;
+            return tud_control_xfer(rhport, req, &sensor_reply, len);
+        }
+        return true;
+    }
+    // Everything else is DSPi's, every stage.
+    bool ok = dspi_vendor_control_xfer_cb(rhport, stage, req);
+    if (stage == CONTROL_STAGE_SETUP) {
+        if (ok) {
+            vendor_requests++;
         } else {
-            audio_spdif_instance_t *inst = spdif_instance_ptrs[i];
-            if (inst && inst->ring) {
-                audio_spdif_set_enabled(inst, false);
-                audio_spdif_ring_reset(inst);
-                spdif_sync[spdif_count++] = inst;
-            }
+            vendor_stalls++;
         }
     }
-    uint32_t flags = save_and_disable_interrupts();
-    audio_spdif_enable_sync(spdif_sync, spdif_count);
-    audio_i2s_enable_sync(i2s_sync, i2s_count);
-    restore_interrupts(flags);
-    pipeline_request_soft_mute(output_ring_target_frames + PRESET_MUTE_SAMPLES);
-}
-
-// The parts of main.c's perform_rate_change() that apply without output hardware. The coefficient
-// recomputes it defers are picked up by service_deferred() on the next pass.
-static void apply_rate(uint32_t rate) {
-    output_rate_hz = rate;
-    output_latency_apply(rate, active_input_source);
-    audio_state.freq = rate;
-    rta_restart();
-    sync_started = false;
-    total_samples_produced = 0;
-    nominal_feedback_10_14 = (uint32_t)(((uint64_t)rate << 14) / 1000u);
-    feedback_10_14 = nominal_feedback_10_14;
-
-    uint32_t flags = save_and_disable_interrupts();
-    dsp_recalculate_all_filters((float)rate);
-    restore_interrupts(flags);
-    loudness_recompute_pending = true;
-    crossfeed_update_pending = true;
-    leveller_update_pending = true;
-    psybass_update_pending = true;
-    subharm_update_pending = true;
-    tube_update_pending = true;
-    limiter_update_pending = true;
-    upmix_update_pending = true;
-    pdm_update_clock(rate);
-    adat_output_on_rate_change(rate);
-    audio_i2s_update_all_frequencies(rate);
-    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
-        audio_spdif_instance_t *inst = spdif_instance_ptrs[i];
-        if (output_types[i] != OUTPUT_TYPE_I2S && inst && inst->ring) {
-            audio_spdif_apply_pio_frequency(inst, rate);
-        }
-    }
-    restart_outputs();
-}
-
-// main.c's coefficient-update handlers for the flags a rate change sets. Loudness is rebuilt in one go
-// (as core0_init does) rather than as main.c's background job. Nothing else sets these flags yet:
-// the vendor command path, and with it eq_update_pending, is not part of this image.
-static void service_deferred(void) {
-    if (loudness_recompute_pending) {
-        loudness_recompute_pending = false;
-        loudness_recompute_table(loudness_ref_spl, loudness_intensity_pct, (float)audio_state.freq);
-        if (loudness_enabled && loudness_active_table) {
-            uint8_t idx = effective_vol_index;
-            if (idx > CENTER_VOLUME_INDEX) {
-                idx = CENTER_VOLUME_INDEX;
-            }
-            current_loudness_coeffs = loudness_active_table[idx];
-        }
-    }
-    if (crossfeed_update_pending) {
-        crossfeed_update_pending = false;
-        crossfeed_apply_config((const CrossfeedConfig *)&crossfeed_config, (float)audio_state.freq);
-    }
-    if (psybass_update_pending) {
-        psybass_update_pending = false;
-        psybass_apply_config((const PsybassConfig *)&psybass_config, (float)audio_state.freq);
-    }
-    if (subharm_update_pending) {
-        subharm_update_pending = false;
-        subharm_apply_config((const SubharmConfig *)&subharm_config, (float)audio_state.freq);
-    }
-    if (tube_update_pending) {
-        tube_update_pending = false;
-        tube_apply_config((const TubeConfig *)&tube_config, (float)audio_state.freq);
-    }
-    if (limiter_update_pending) {
-        limiter_update_pending = false;
-        limiter_apply_config((float)audio_state.freq);
-    }
-    if (upmix_update_pending) {
-        upmix_update_pending = false;
-        upmix_apply_config((const UpmixConfig *)&upmix_config, (float)audio_state.freq);
-    }
-    if (leveller_update_pending) {
-        leveller_update_pending = false;
-        leveller_compute_coefficients(&leveller_coeffs, (const LevellerConfig *)&leveller_config,
-                                      (float)audio_state.freq);
-        if (leveller_reset_pending) {
-            leveller_reset_pending = false;
-            leveller_reset_state(&leveller_state);
-        }
-        leveller_bypassed = !leveller_config.enabled;
-    }
-    // The Core 1 EQ worker does not exist here, so the pipeline must never dispatch to it.
-    if (core1_mode != CORE1_MODE_IDLE) {
-        core1_mode = CORE1_MODE_IDLE;
-    }
-}
-
-// main.c's core0_init() in the same order, keeping what applies without RP2350 hardware or flash.
-// Skipped: clocks and regulator, soft VCXO, stall alarm, clock diagnostics, preset load (factory
-// defaults stay in force), DAC mute, PDM hardware and Core 1, S/PDIF and I2S receivers, LG Sound Sync,
-// notifications, UART/I2C control and Control Surfaces.
-static void dspi_init(void) {
-    output_latency_apply(48000u, INPUT_SOURCE_USB);
-    usb_sound_card_init();
-    adat_output_init();
-
-    nominal_feedback_10_14 = (uint32_t)(((uint64_t)audio_state.freq << 14) / 1000u);
-    feedback_10_14 = nominal_feedback_10_14;
-    output_latency_apply(48000u, active_input_source);
-
-    uint32_t flags = save_and_disable_interrupts();
-    dsp_recalculate_all_filters(48000.0f);
-    restore_interrupts(flags);
-
-    loudness_recompute_table(loudness_ref_spl, loudness_intensity_pct, 48000.0f);
-    if (loudness_enabled && loudness_active_table) {
-        current_loudness_coeffs = loudness_active_table[effective_vol_index];
-    }
-    leveller_compute_coefficients(&leveller_coeffs, (const LevellerConfig *)&leveller_config, 48000.0f);
-    leveller_reset_state(&leveller_state);
-    leveller_bypassed = !leveller_config.enabled;
-    psybass_apply_config((const PsybassConfig *)&psybass_config, 48000.0f);
-    subharm_apply_config((const SubharmConfig *)&subharm_config, 48000.0f);
-    tube_apply_config((const TubeConfig *)&tube_config, 48000.0f);
-    limiter_apply_config(48000.0f);
-    upmix_apply_config((const UpmixConfig *)&upmix_config, 48000.0f);
-
-    // Single core: Core 1 stays idle whatever the outputs say, and PDM is off.
-    core1_mode = CORE1_MODE_IDLE;
-    pdm_set_enabled(false);
-    rta_init();
-
-    // usb_sound_card_init() queues a rate change for main.c's loop. Here the rate comes from the UAC2
-    // clock (48 kHz until the host sets it), and a stream start applies whatever the host chose.
-    rate_change_pending = false;
-    apply_rate(current_rate);
+    return ok;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -670,7 +633,6 @@ static void run_block(uint32_t frames, uint8_t alt) {
         sync_started = true;
     }
     total_samples_produced += frames;
-    input_delivery_mark();
 
     uint32_t t0 = board_micros();
     process_input_block(frames);
@@ -685,24 +647,27 @@ static void run_block(uint32_t frames, uint8_t alt) {
     }
 }
 
+// A starting stream only restarts the pipeline while USB is the selected input.
 static void stream_start(void) {
-    if (audio_state.freq != current_rate) {
-        apply_rate(current_rate);
-    } else {
-        restart_outputs();
-    }
     sync_started = false;
     total_samples_produced = 0;
-    pipeline_reset_cpu_metering();
+    if (active_input_source == INPUT_SOURCE_USB) {
+        z4_stream_restart();
+    }
     dspi_blocks = dspi_frames = dspi_us_last = dspi_us_max = 0;
     dspi_us_total = 0;
 }
 
+// While another input is selected the host's stream is drained and dropped, as DSPi ignores it.
 static void consume_task(void) {
     static uint32_t last_us;
     static uint32_t frac;       // frames * 1e6, carried between ticks for 44.1 kHz
     static bool running;
+    static bool busy;
 
+    if (busy) {
+        return;     // a stream restart is settling the pipeline from in here
+    }
     uint32_t now = board_micros();
     if (now - last_us < 1000u) {
         return;
@@ -716,11 +681,13 @@ static void consume_task(void) {
     uint8_t alt = current_alt;
     uint16_t level = tud_audio_available();
     stats.fifo_level = level;
+    bool usb_source = active_input_source == INPUT_SOURCE_USB;
     if (alt == 0) {
         if (running) {
             sync_started = false;
         }
         running = false;
+        consumer_running = false;
         frac = 0;
         return;
     }
@@ -729,15 +696,20 @@ static void consume_task(void) {
             return;
         }
         running = true;
+        busy = true;
         stream_start();
+        busy = false;
         last_us = board_micros();
         elapsed = 1000u;
-    } else if (audio_state.freq != current_rate) {
+    } else if (usb_source && audio_state.freq != current_rate) {
+        busy = true;
         stream_start();     // the host changed rate without closing the stream
+        busy = false;
         last_us = board_micros();
         elapsed = 1000u;
         frac = 0;
     }
+    consumer_running = usb_source;
 
     uint32_t bytes_per_frame = 2u * (alt == 1 ? 2u : 3u);
     frac += current_rate * elapsed;
@@ -760,9 +732,37 @@ static void consume_task(void) {
         if (n == 0) {
             break;
         }
-        run_block(n, alt);
+        if (usb_source) {
+            run_block(n, alt);
+        }
         frames -= n;
     }
+}
+
+// ---------------------------------------------------------------------------------------------------
+// Hooks for DSPi and z4_mainloop.c
+
+void z4_service_producer(void) {
+    tud_task();
+    consume_task();
+    input_delivery_mark();
+    siggen_pump();
+    output_rings_idle_pump();
+    notify_drain(0);
+}
+
+bool z4_stream_running(void) {
+    return consumer_running;
+}
+
+uint32_t z4_host_rate(void) {
+    return current_rate;
+}
+
+// Replaces usb_audio.c's (renamed there): DSPi's version times UAC1 packets, which never arrive here.
+// The test-signal pump asks it whether USB is already producing blocks.
+bool usb_audio_stream_active(void) {
+    return consumer_running && sync_started;
 }
 
 // ---------------------------------------------------------------------------------------------------
@@ -776,9 +776,14 @@ static void set_serial_string(void) {
         uint32_t nib = (uint32_t)(serial >> (60 - 4 * i)) & 0xFu;
         usb_serial_string[i] = (char)(nib < 10 ? '0' + nib : 'A' + nib - 10);
     }
+    // DSPi's own copy, which its vendor requests report (RP2350: the chip ID).
+    memcpy(usb_descriptor_str_serial, usb_serial_string, sizeof(usb_descriptor_str_serial));
 }
 
 int main(void) {
+#if BCM_VERSION == 2837
+    mmu_enable();   // D-cache on: DSP data no longer comes from SDRAM on every access
+#endif
     board_led_init();
     uart_init(BOARD_UART_CLOCK_HZ, BOARD_UART_BAUD);
     uart_puts("\nDSPi PiZero Z4 pipeline (" __DATE__ " " __TIME__ ")\n");
@@ -786,8 +791,7 @@ int main(void) {
     mbox_set_power_state(VCMAILBOX_DEVICE_USB_HCD, 1);
     uart_set_buffered(1);
 
-    dspi_init();
-    service_deferred();
+    z4_dspi_init();
 
     irq_set_handler(IRQ_USB, usb_irq);
     tusb_rhport_init_t dev_init = {.role = TUSB_ROLE_DEVICE, .speed = TUSB_SPEED_HIGH};
@@ -797,10 +801,9 @@ int main(void) {
     uint32_t last_toggle = board_micros();
     int led_on = 1;
     for (;;) {
-        tud_task();
-        consume_task();
-        output_rings_idle_pump();
-        service_deferred();
+        sensors_refresh();
+        z4_service_producer();
+        z4_dspi_service();
         uart_poll();
 
         if (reboot_requested) {

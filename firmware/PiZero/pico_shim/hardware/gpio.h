@@ -35,6 +35,12 @@ enum gpio_irq_level {
     GPIO_IRQ_EDGE_RISE = 0x8u,
 };
 
+// IO bank 0 edge interrupts (Control Surfaces IR receiver). Enabling records nothing and no edge is
+// ever reported.
+#define IO_IRQ_BANK0 21u
+void gpio_set_irq_enabled(uint gpio, uint32_t event_mask, bool enabled);
+void gpio_acknowledge_irq(uint gpio, uint32_t event_mask);
+
 void gpio_init(uint gpio);
 void gpio_deinit(uint gpio);
 void gpio_set_function(uint gpio, gpio_function_t fn);

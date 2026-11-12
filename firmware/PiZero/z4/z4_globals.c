@@ -1,11 +1,10 @@
-// Definitions for the globals DSPi's main.c and flash_storage.c provide (see z4_globals.h). Types and
+// Definitions for the globals DSPi's main.c provides (see z4_globals.h). Types and
 // initial values follow those files.
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #include "config.h"
-#include "flash_storage.h"
 #include "usb_audio.h"
 
 #include "z4_globals.h"
@@ -25,7 +24,3 @@ volatile uint32_t spdif_underruns = 0;
 volatile uint32_t usb_audio_packets = 0;
 volatile uint32_t usb_audio_alt_set = 0;
 volatile uint32_t usb_audio_mounted = 0;
-
-// flash_storage.c: the preset mute, which also gates the pipeline's mute envelope.
-volatile bool preset_loading = false;
-volatile uint32_t preset_mute_counter = 0;

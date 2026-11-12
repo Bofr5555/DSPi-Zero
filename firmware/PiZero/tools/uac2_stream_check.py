@@ -55,6 +55,9 @@ def read_stats(dev):
                  block_us_last=us_last, block_us_max=us_max, block_us_avg=us_avg100 / 100, clip_flags=clip,
                  peaks=peaks, slot0_fill=fill, ring_target=target, ring_drops=drops,
                  slot0_underrun_frames=under_f, slot0_drop_frames=drop_f, pipeline_rate=prate)
+    if version >= 3 and len(raw) >= 220:   # Z4b: vendor requests and notifications
+        vreq, vstall, npkt, nidle = struct.unpack_from("<4I", raw, 204)
+        s.update(vendor_requests=vreq, vendor_stalls=vstall, notify_packets=npkt, notify_keepalives=nidle)
     s.update(version=version, uptime_ms=uptime_ms, rate=rate, alt=alt, mounted=mounted, speed=speed)
     return s
 
@@ -150,6 +153,9 @@ def main():
                   f"{s['frames'] / max(s['blocks'], 1):.1f} frames, blocks {s['blocks']}, slot0 fill {s['slot0_fill']} "
                   f"(target {s['ring_target']}), ring drops {s['ring_drops']}, underrun frames "
                   f"{s['slot0_underrun_frames']}, peaks in {s['peaks'][:2]} out {s['peaks'][8:10]}", flush=True)
+        if "vendor_requests" in s:
+            print(f"    vendor requests {s['vendor_requests']} ({s['vendor_stalls']} stalled), notifications "
+                  f"{s['notify_packets']} + {s['notify_keepalives']} keep-alive", flush=True)
         print(f"    EP2 IN DIEPCTL {s['fb_diepctl']:08x} DIEPTSIZ {s['fb_dieptsiz']:08x} busy {s['fb_busy']} "
               f"parity {s['fb_parity']}; EP1 OUT DOEPCTL {s['data_doepctl']:08x} parity {s['data_parity']}; "
               f"GINTMSK {s['gintmsk']:08x}", flush=True)

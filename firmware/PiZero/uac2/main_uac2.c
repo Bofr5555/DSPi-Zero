@@ -28,6 +28,9 @@ uint32_t tusb_time_millis_api(void) {
 
 static void usb_irq(void) {
     tud_int_handler(0);
+    // Read back from the controller so its interrupt-clear writes have landed before we return.
+    // Otherwise the line is still high and the IRQ fires again with nothing pending.
+    (void)*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + 0x014);    // GINTSTS
 }
 
 // ---------------------------------------------------------------------------------------------------
