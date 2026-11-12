@@ -1,0 +1,3 @@
+firmware/PiZero/build*/
+__pycache__/
+.DS_Store

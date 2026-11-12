@@ -18,9 +18,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Adafruit broadcom-peripherals, fetched by: python3 tools/get_deps.py broadcom_32bit (inside TinyUSB).
-set(BCM_DIR ${CMAKE_CURRENT_LIST_DIR}/../pico-sdk/lib/tinyusb/hw/mcu/broadcom)
+set(BCM_DIR ${CMAKE_CURRENT_LIST_DIR}/../../DSPi/firmware/pico-sdk/lib/tinyusb/hw/mcu/broadcom)
 if(NOT EXISTS ${BCM_DIR}/broadcom/vcmailbox.c)
-    message(FATAL_ERROR "broadcom-peripherals missing. Run: cd firmware/pico-sdk/lib/tinyusb && python3 tools/get_deps.py broadcom_32bit")
+    message(FATAL_ERROR "broadcom-peripherals missing. Run: cd DSPi/firmware/pico-sdk/lib/tinyusb && python3 tools/get_deps.py broadcom_32bit")
 endif()
 
 set(PIZERO_BOARD zero CACHE STRING "Target board: zero (BCM2835) or zero2 (BCM2837, AArch32)")
@@ -101,7 +101,7 @@ add_executable(pizero_z0 ${PLATFORM_SRC} main_z0.c)
 pizero_image(pizero_z0)
 
 # Z1: TinyUSB vendor echo on the DWC2 controller, polled from the main loop.
-set(TUSB_DIR ${CMAKE_CURRENT_LIST_DIR}/../pico-sdk/lib/tinyusb/src)
+set(TUSB_DIR ${CMAKE_CURRENT_LIST_DIR}/../../DSPi/firmware/pico-sdk/lib/tinyusb/src)
 add_library(tinyusb_z1 STATIC
     ${TUSB_DIR}/tusb.c
     ${TUSB_DIR}/common/tusb_fifo.c
@@ -121,7 +121,7 @@ pizero_image(pizero_z1)
 
 # Z2: DSPi's own UAC1 descriptors (firmware/DSPi/usb_descriptors.c, stereo alts only, product string renamed)
 # with a cut-down copy of its class driver. z2/shim stands in for the one Pico SDK header it includes.
-set(DSPI_DIR ${CMAKE_CURRENT_LIST_DIR}/../DSPi)
+set(DSPI_DIR ${CMAKE_CURRENT_LIST_DIR}/../../DSPi/firmware/DSPi)   # the DSPi submodule
 add_library(tinyusb_z2 STATIC
     ${TUSB_DIR}/tusb.c
     ${TUSB_DIR}/common/tusb_fifo.c
@@ -211,7 +211,7 @@ pizero_image(pizero_uac2)
 # into the pipeline every millisecond and the output rings are drained by the system timer, standing
 # in for the outputs. Loaded over USB (not staged on the SD card). Zero 2 W only, see below.
 if(PIZERO_BOARD STREQUAL "zero2")
-    set(PICO_EXTRAS_DIR ${CMAKE_CURRENT_LIST_DIR}/../pico-extras/src/rp2_common)
+    set(PICO_EXTRAS_DIR ${CMAKE_CURRENT_LIST_DIR}/../../DSPi/firmware/pico-extras/src/rp2_common)
     set(Z4_DSPI_FILES
         audio_pipeline.c
         usb_audio.c

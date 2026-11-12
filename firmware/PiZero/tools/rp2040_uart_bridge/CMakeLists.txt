@@ -2,7 +2,7 @@
 #   cmake -S firmware/PiZero/tools/rp2040_uart_bridge -B firmware/PiZero/build/uart_bridge -G Ninja
 cmake_minimum_required(VERSION 3.13)
 
-set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/../../../pico-sdk)
+set(PICO_SDK_PATH ${CMAKE_CURRENT_LIST_DIR}/../../../../DSPi/firmware/pico-sdk)
 set(PICO_BOARD pico)
 include(${PICO_SDK_PATH}/external/pico_sdk_import.cmake)
 

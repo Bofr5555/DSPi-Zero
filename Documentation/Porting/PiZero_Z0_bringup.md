@@ -17,10 +17,14 @@ Any CPU exception prints a `FAULT:` line and makes the LED flash fast (10 Hz).
 
 ## 2. Build
 
-The build needs `arm-none-eabi-gcc`, CMake and Ninja. It also needs Adafruit's `broadcom-peripherals` inside TinyUSB. That was fetched on 2026-11-03 and lives in the TinyUSB submodule as untracked files. On a fresh checkout, fetch it again first.
+The build needs `arm-none-eabi-gcc`, CMake and Ninja. DSPi itself, with its pico-sdk and TinyUSB, is the `DSPi` submodule. The build also needs Adafruit's `broadcom-peripherals` inside TinyUSB, which lives there as untracked files. On a fresh checkout, fetch the submodules and then that dependency.
 
 ```bash
-cd firmware/pico-sdk/lib/tinyusb && python3 tools/get_deps.py broadcom_32bit
+git submodule update --init --recursive
+```
+
+```bash
+cd DSPi/firmware/pico-sdk/lib/tinyusb && python3 tools/get_deps.py broadcom_32bit
 ```
 
 Then build from the repo root.

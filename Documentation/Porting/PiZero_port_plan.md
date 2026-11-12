@@ -76,7 +76,7 @@ Worth checking at this step is whether USB boot (`rpiboot` from the Raspberry Pi
 
 ### Z1. TinyUSB enumeration
 
-Fetch TinyUSB's Broadcom dependency (`python3 tools/get_deps.py broadcom_32bit` inside `firmware/pico-sdk/lib/tinyusb`, which pulls Adafruit's `broadcom-peripherals` into `hw/mcu/broadcom`). Build a vendor-class device on the `raspberrypi_zero` board. Force Full Speed with `CFG_TUD_MAX_SPEED = OPT_MODE_FULL_SPEED`, so the existing UAC1 descriptors and the 3-byte 10.14 feedback format carry over unchanged. High Speed is a later step.
+Fetch TinyUSB's Broadcom dependency (`python3 tools/get_deps.py broadcom_32bit` inside `DSPi/firmware/pico-sdk/lib/tinyusb`, which pulls Adafruit's `broadcom-peripherals` into `hw/mcu/broadcom`). Build a vendor-class device on the `raspberrypi_zero` board. Force Full Speed with `CFG_TUD_MAX_SPEED = OPT_MODE_FULL_SPEED`, so the existing UAC1 descriptors and the 3-byte 10.14 feedback format carry over unchanged. High Speed is a later step.
 
 **Pass:** macOS enumerates the device at 12 Mbit/s, and a pyusb vendor echo test round-trips byte-perfect.
 
