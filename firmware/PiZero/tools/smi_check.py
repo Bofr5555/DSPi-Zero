@@ -28,7 +28,7 @@ def smi_stats(dev):
     if s["version"] < 7:
         raise SystemExit(f"FAIL: stats version {s['version']}, need 7 (load the SMI pizero_z4.img)")
     d = dict(zip(SMI_FIELDS, struct.unpack_from("<12I", raw, 300)))
-    fb = struct.unpack_from("<4I2i", raw, 348) if len(raw) >= 372 else None
+    fb = struct.unpack_from("<3I2iI", raw, 348) if len(raw) >= 372 else None
     if fb:
         d.update(fb_sent=fb[0], fb_rate_iir=fb[1], fb_rate_long=fb[2], fb_servo=fb[3], fb_fill_err=fb[4])
     d["s"] = s

@@ -13,6 +13,8 @@ uint32_t mbox_clock_rate_max(uint32_t clock_id);             // highest rate the
 uint32_t mbox_set_clock_rate(uint32_t clock_id, uint32_t hz);  // returns the rate actually set, 0 on failure
 uint32_t mbox_voltage_uv(uint32_t voltage_id);  // microvolts; id 1 is the core. 0 if unavailable
 uint32_t mbox_temperature_mc(void);             // SoC temperature in millidegrees C. 0 if unavailable
+uint32_t mbox_clock_rate_min(uint32_t clock_id);             // lowest rate the firmware allows
+uint32_t mbox_set_clock_state(uint32_t clock_id, uint32_t on); // returns the new state word, all ones on failure
 uint32_t mbox_dma_channels(void);               // mask of DMA channels free for the ARM. 0 if unavailable
 int mbox_arm_memory(uint32_t *base, uint32_t *size);
 // Returns the firmware's reply state (bit 0 on, bit 1 device missing), or -1 on failure.

@@ -1,0 +1,263 @@
+// PLLA retune in place and the clock manager's frequency counter (PiZero_PLLA_plan.md phases 1 to 3).
+// Register layout and the divider load sequence follow Linux clk-bcm2835.c. Every write carries the
+// clock manager password. Work requested over USB runs from the main loop, never from the USB IRQ.
+
+#include "pll_out.h"
+
+#define REG(a) (*(volatile uint32_t *)(a))
+
+#define CPRMAN 0x3F101000u
+#define PASSWD (0x5Au << 24)
+#define CM_PCMCTL (CPRMAN + 0x098u)
+#define CM_PCMDIV (CPRMAN + 0x09cu)
+#define CM_V3DCTL (CPRMAN + 0x038u)
+#define CM_V3DDIV (CPRMAN + 0x03cu)
+#define CM_TCNTCTL (CPRMAN + 0x0c0u)
+#define CM_TCNTCNT (CPRMAN + 0x0c4u)
+#define CM_OSCCOUNT (CPRMAN + 0x100u)
+#define CM_PLLA (CPRMAN + 0x104u)
+#define CM_LOCK (CPRMAN + 0x114u)
+#define A2W_PLLA_ANA1 (CPRMAN + 0x1014u)
+#define A2W_PLLA_CTRL (CPRMAN + 0x1100u)
+#define A2W_PLLA_FRAC (CPRMAN + 0x1200u)
+#define A2W_PLLA_CORE (CPRMAN + 0x1400u)
+#define A2W_PLLA_PER (CPRMAN + 0x1500u)
+
+#define CM_ENAB (1u << 4)
+#define CM_KILL (1u << 5)
+#define CM_BUSY (1u << 7)
+#define FLOCKA (1u << 8)
+#define HOLDPER (1u << 7)
+#define LOADPER (1u << 6)
+#define LOAD_BITS 0x55u             // LOADPER, LOADCORE, LOADCCP2, LOADDSI0
+#define NDIV_MASK 0x3FFu
+#define FRAC_MASK 0xFFFFFu
+#define CHANNEL_DISABLE (1u << 8)
+
+#define LOCK_SPIN_US 300u           // tight polling after the write, then once per main loop pass
+#define LOCK_TIMEOUT_US 100000u     // Linux's LOCK_TIMEOUT_NS
+
+typedef struct {
+    uint16_t ndiv;
+    uint32_t frac;
+    uint8_t per_div;
+} row_t;
+
+// NDIV and FRAC are for a reference of 2 x 19.2 MHz: the firmware leaves the feedback pre-divider on.
+static const row_t rows[PLL_ROW_COUNT] = {
+    [PLL_ROW_A48] = {61, 0x70A3D, 8},
+    [PLL_ROW_A44] = {56, 0x72B02, 8},
+    [PLL_ROW_B48] = {48, 0x00000, 5},
+    [PLL_ROW_B44] = {44, 0x1999A, 5},
+};
+
+static pll_out_status_t st = {.magic = PLL_OUT_MAGIC, .unlock_first_us = 0xFFFFFFFFu};
+static bool fw_saved, counter_claimed, prev_set;
+static volatile uint32_t pending_row = 0xFFFFFFFFu;
+static volatile uint32_t pending_mux = 0xFFFFFFFFu, pending_osc;
+static uint32_t write_us, count_start_us;
+static const row_t *active;
+
+static uint32_t micros(void) {
+    return REG(0x3F003004u);
+}
+
+static uint32_t rd(uint32_t a) {
+    return REG(a) & 0x00FFFFFFu;
+}
+
+static void wr(uint32_t a, uint32_t v) {
+    REG(a) = PASSWD | (v & 0x00FFFFFFu);
+}
+
+static void save_firmware_values(void) {
+    if (fw_saved) {
+        return;
+    }
+    fw_saved = true;
+    st.fw_ctrl = rd(A2W_PLLA_CTRL);
+    st.fw_frac = rd(A2W_PLLA_FRAC);
+    st.fw_per = rd(A2W_PLLA_PER);
+    st.fw_cm_plla = rd(CM_PLLA);
+}
+
+// Moves NDIV and FRAC so the VCO never passes above the higher of the old and new values. CTRL is
+// written last either way, in case FRAC only takes effect on a CTRL write.
+static void write_multiplier(uint32_t ndiv, uint32_t frac) {
+    uint32_t ctrl = rd(A2W_PLLA_CTRL);
+    uint64_t cur = (uint64_t)(ctrl & NDIV_MASK) << 20 | (rd(A2W_PLLA_FRAC) & FRAC_MASK);
+    uint64_t tgt = (uint64_t)ndiv << 20 | frac;
+    ctrl = (ctrl & ~NDIV_MASK) | ndiv;
+    if (tgt < cur) {
+        wr(A2W_PLLA_CTRL, ctrl);
+    }
+    wr(A2W_PLLA_FRAC, frac);
+    wr(A2W_PLLA_CTRL, ctrl);
+}
+
+static void retune(uint32_t row) {
+    save_firmware_values();
+    // Hold the PER channel while the VCO moves. The other hold bits stay as the firmware set them.
+    wr(CM_PLLA, (rd(CM_PLLA) & ~LOAD_BITS) | HOLDPER);
+    if (row == PLL_ROW_FIRMWARE) {
+        write_multiplier(st.fw_ctrl & NDIV_MASK, st.fw_frac & FRAC_MASK);
+        active = 0;
+    } else {
+        write_multiplier(rows[row].ndiv, rows[row].frac);
+        active = &rows[row];
+    }
+    st.row = row;
+    st.retunes++;
+    st.state = PLL_WAITING;
+    st.unlock_first_us = 0xFFFFFFFFu;
+    st.unlock_reads = 0;
+    st.lock_reads = 0;
+    prev_set = false;
+    write_us = micros();
+}
+
+// Called once FLOCKA is set: start the PER channel at the row's divider, or put it back as found.
+static void release_per(void) {
+    if (active) {
+        wr(A2W_PLLA_PER, active->per_div);      // clears CHANNEL_DISABLE
+        uint32_t cm = rd(CM_PLLA) & ~LOAD_BITS;
+        wr(CM_PLLA, cm | LOADPER);
+        wr(CM_PLLA, cm);
+        wr(CM_PLLA, cm & ~HOLDPER);
+    } else {
+        wr(A2W_PLLA_PER, st.fw_per | CHANNEL_DISABLE);
+        wr(CM_PLLA, st.fw_cm_plla & ~LOAD_BITS);
+    }
+}
+
+// Samples FLOCKA during the lock wait. lock_us is when it was last seen to go from clear to set.
+static bool lock_sample(void) {
+    uint32_t t = micros() - write_us;
+    st.lock_reads++;
+    if (REG(CM_LOCK) & FLOCKA) {
+        if (!prev_set) {
+            st.lock_us = t;
+        }
+        prev_set = true;
+        return true;
+    }
+    if (st.unlock_first_us == 0xFFFFFFFFu) {
+        st.unlock_first_us = t;
+    }
+    st.unlock_reads++;
+    prev_set = false;
+    return false;
+}
+
+// FLOCKA may still be set for a moment after the write, so a set bit only counts as lock once the
+// spin has run its course.
+static void lock_wait_step(bool spin) {
+    if (spin) {
+        bool locked = false;
+        while (micros() - write_us < LOCK_SPIN_US) {
+            locked = lock_sample();
+        }
+        if (!locked) {
+            return;
+        }
+    } else if (!lock_sample()) {
+        if (micros() - write_us > LOCK_TIMEOUT_US) {
+            st.state = PLL_TIMEOUT;
+        }
+        return;
+    }
+    st.state = PLL_LOCKED;
+    release_per();
+}
+
+static void count_start(uint32_t mux, uint32_t osc) {
+    counter_claimed = true;
+    wr(CM_TCNTCTL, CM_KILL);
+    wr(CM_TCNTCTL, (mux & 0xFu) | (mux >> 4) << 12);
+    wr(CM_OSCCOUNT, osc);
+    st.count_mux = mux;
+    st.count_osc = osc;
+    st.count_state = COUNT_RUNNING;
+    count_start_us = micros();
+}
+
+static void count_step(void) {
+    uint32_t t = micros() - count_start_us;
+    if (t < st.count_osc / 19u + 1000u) {
+        return;     // the gate is osc_cycles of 19.2 MHz; Linux also waits at least 1 ms
+    }
+    if (rd(CM_OSCCOUNT) == 0 && !(REG(CM_TCNTCTL) & CM_BUSY)) {
+        st.count = rd(CM_TCNTCNT);      // 24 bits in hardware: keep gate x rate below 2^24
+        st.count_us = t;
+        st.count_seq++;
+        st.count_state = COUNT_DONE;
+        wr(CM_TCNTCTL, 0);
+    } else if (t > st.count_osc / 19u + 100000u) {
+        st.count_state = COUNT_TIMEOUT;
+        wr(CM_TCNTCTL, 0);
+    }
+}
+
+void pll_out_request(uint32_t row) {
+    if (row < PLL_ROW_COUNT) {
+        pending_row = row;
+    }
+}
+
+void pll_out_count_request(uint32_t mux, uint32_t osc_cycles) {
+    pending_osc = osc_cycles;
+    pending_mux = mux;
+}
+
+bool pll_out_counter_claimed(void) {
+    return counter_claimed;
+}
+
+void pll_out_pcm_clock(uint32_t src, uint32_t divi) {
+    wr(CM_PCMCTL, CM_KILL);
+    uint32_t t0 = micros();
+    while ((REG(CM_PCMCTL) & CM_BUSY) && micros() - t0 < 1000u) {
+    }
+    if (divi == 0) {
+        wr(CM_PCMCTL, 0);
+        return;
+    }
+    wr(CM_PCMDIV, (divi & 0xFFFu) << 12);
+    wr(CM_PCMCTL, src & 0xFu);
+    wr(CM_PCMCTL, (src & 0xFu) | CM_ENAB);
+}
+
+void pll_out_poll(void) {
+    uint32_t row = pending_row;
+    if (row != 0xFFFFFFFFu && st.state != PLL_WAITING) {
+        pending_row = 0xFFFFFFFFu;
+        retune(row);
+        lock_wait_step(true);
+    } else if (st.state == PLL_WAITING) {
+        lock_wait_step(false);
+    } else if (st.state == PLL_LOCKED && !(REG(CM_LOCK) & FLOCKA)) {
+        st.lock_lost++;
+    }
+    uint32_t mux = pending_mux;
+    if (mux != 0xFFFFFFFFu && st.count_state != COUNT_RUNNING) {
+        pending_mux = 0xFFFFFFFFu;
+        count_start(mux, pending_osc);
+    } else if (st.count_state == COUNT_RUNNING) {
+        count_step();
+    }
+}
+
+void pll_out_status(pll_out_status_t *out) {
+    st.ctrl = rd(A2W_PLLA_CTRL);
+    st.frac = rd(A2W_PLLA_FRAC);
+    st.ana1 = rd(A2W_PLLA_ANA1);
+    st.per = rd(A2W_PLLA_PER);
+    st.core = rd(A2W_PLLA_CORE);
+    st.cm_plla = rd(CM_PLLA);
+    st.cm_lock = rd(CM_LOCK);
+    st.v3d_ctl = rd(CM_V3DCTL);
+    st.v3d_div = rd(CM_V3DDIV);
+    st.pcm_ctl = rd(CM_PCMCTL);
+    st.pcm_div = rd(CM_PCMDIV);
+    *out = st;
+}

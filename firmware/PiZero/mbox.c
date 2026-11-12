@@ -148,6 +148,16 @@ uint64_t mbox_board_serial(void) {
     return v ? ((uint64_t)v[1] << 32) | v[0] : 0;
 }
 
+uint32_t mbox_clock_rate_min(uint32_t clock_id) {
+    volatile uint32_t *v = mbox_query(0x00030007u, 8, clock_id, 0);     // GET_MIN_CLOCK_RATE
+    return v ? v[1] : 0;
+}
+
+uint32_t mbox_set_clock_state(uint32_t clock_id, uint32_t on) {
+    volatile uint32_t *v = mbox_query(0x00038001u, 8, clock_id, on ? 1u : 0u);  // SET_CLOCK_STATE
+    return v ? v[1] : 0xFFFFFFFFu;
+}
+
 uint32_t mbox_dma_channels(void) {
     // GET_DMA_CHANNELS: a mask of the DMA channels the firmware leaves to the ARM.
     volatile uint32_t *v = mbox_query(0x00060001u, 4, 0, 0);

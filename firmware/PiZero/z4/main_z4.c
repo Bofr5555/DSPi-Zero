@@ -42,6 +42,8 @@
 #include "pmu.h"
 #include "pcm_out.h"
 #include "smi_out.h"
+#include "clk_dump.h"
+#include "pll_out.h"
 #include "z4_prof.h"
 
 uint32_t tusb_time_millis_api(void) {
@@ -547,7 +549,9 @@ static void sensors_refresh(void) {
     }
     primed = true;
     last_us = now;
-    sensor_arm_hz = mbox_clock_rate_measured(VCMAILBOX_CLOCK_ARM);
+    if (!pll_out_counter_claimed()) {   // the firmware may measure with the same counter
+        sensor_arm_hz = mbox_clock_rate_measured(VCMAILBOX_CLOCK_ARM);
+    }
     sensor_core_mv = (mbox_voltage_uv(1) + 500u) / 1000u;
     sensor_temp_cc = (int32_t)(mbox_temperature_mc() + 5u) / 10;
 }
@@ -572,6 +576,61 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     if (bench && req->bRequest == 0x4D && !in) {
         if (stage == CONTROL_STAGE_SETUP) {
             z4_prof_start(req->wValue);
+            return tud_control_status(rhport, req);
+        }
+        return true;
+    }
+    // 0x4C: clock register dump, boot snapshot and live values; wValue bit 0 adds the firmware's clock
+    // rates, which takes mailbox calls long enough to disturb streaming.
+    if (bench && req->bRequest == 0x4C && in) {
+        static clk_dump_t dump;
+        if (stage == CONTROL_STAGE_SETUP) {
+            uint32_t len = clk_dump_fill(&dump, req->wValue & 1u);
+            return tud_control_xfer(rhport, req, &dump, req->wLength < len ? req->wLength : (uint16_t)len);
+        }
+        return true;
+    }
+    // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
+    // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
+    // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles. IN returns the status.
+    if (bench && req->bRequest == 0x46) {
+        static pll_out_status_t pst;
+        if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+        }
+        if (in) {
+            pll_out_status(&pst);
+            return tud_control_xfer(rhport, req, &pst, req->wLength < sizeof(pst) ? req->wLength : sizeof(pst));
+        }
+        if (req->wValue == 1) {
+            pll_out_request(req->wIndex);
+        } else if (req->wValue == 2) {
+            pll_out_pcm_clock(req->wIndex >> 12, req->wIndex & 0xFFFu);
+        } else if (req->wValue == 3) {
+            uint32_t gates = req->wIndex >> 8;
+            pll_out_count_request(req->wIndex & 0xFFu, (gates ? gates : 1u) * 192000u);
+        } else {
+            return false;
+        }
+        return tud_control_status(rhport, req);
+    }
+    // 0x4A: firmware clock probes for the PLLA plan (phase 0). wValue 1 sets the V3D clock to wIndex MHz,
+    // 2 sets the V3D clock state to wIndex, 3 sets the ARM clock to wIndex MHz (0 its minimum, 0xFFFF its
+    // maximum). Mailbox calls stall the main loop, so these are for bench use only.
+    if (bench && req->bRequest == 0x4A && !in) {
+        if (stage == CONTROL_STAGE_SETUP) {
+            if (req->wValue == 1) {
+                mbox_set_clock_rate(VCMAILBOX_CLOCK_V3D, (uint32_t)req->wIndex * 1000000u);
+            } else if (req->wValue == 2) {
+                mbox_set_clock_state(VCMAILBOX_CLOCK_V3D, req->wIndex);
+            } else if (req->wValue == 3) {
+                uint32_t hz = req->wIndex == 0 ? mbox_clock_rate_min(VCMAILBOX_CLOCK_ARM)
+                              : req->wIndex == 0xFFFF ? mbox_clock_rate_max(VCMAILBOX_CLOCK_ARM)
+                                                      : (uint32_t)req->wIndex * 1000000u;
+                mbox_set_clock_rate(VCMAILBOX_CLOCK_ARM, hz);
+            } else {
+                return false;
+            }
             return tud_control_status(rhport, req);
         }
         return true;
@@ -947,6 +1006,7 @@ static void set_serial_string(void) {
 }
 
 int main(void) {
+    clk_dump_boot_snapshot();   // clocks exactly as the firmware left them (PLLA plan phase 0)
 #if BCM_VERSION == 2837
     mmu_enable();   // D-cache on: DSP data no longer comes from SDRAM on every access
     pmu_counters = pmu_init();
@@ -980,6 +1040,7 @@ int main(void) {
     int led_on = 1;
     for (;;) {
         sensors_refresh();
+        pll_out_poll();
         z4_service_producer();
         z4_dspi_service();
         uart_poll();
