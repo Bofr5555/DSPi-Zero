@@ -350,6 +350,8 @@ cmake --build firmware/PiZero/build-zero2
 /opt/homebrew/bin/python3.14 firmware/PiZero/tools/uac2_stream_check.py 20
 ```
 
+*Update (2026-11-11): data OUT now runs every 1 ms (`bInterval` 4, 582 bytes maximum, an 8-packet FIFO), not every microframe. See section 15 for why, and for the OUT parity search that makes it work.*
+
 **Device** (`uac2/usb_descriptors.c`). The device is `2E8B:FEAA`, bcdDevice `0x0300`, "Weeb Labs DSPi Zero", with the board serial. The audio function is a UAC2 speaker with these entities:
 
 - clock source 4, with 44.1, 48 and 96 kHz
@@ -403,3 +405,34 @@ The 40 underruns outside the windows come at stream edges, as the FIFO drains af
 - Every-microframe retargeting lost feedback for good after 7 restarts.
 - 1 ms data packets only started 1 time in 11.
 - An earlier per-SOF write of the feedback endpoint control register lost about 16 packets a second after a while.
+
+## 15. Z4a: DSPi's pipeline on received audio
+
+*Added: 2026-11-11*
+
+`pizero_z4.img` runs DSPi's real RP2350 float pipeline on the UAC2 stream. The DSPi files are compiled unchanged with `PICO_RP2350=1` against stand-in Pico SDK headers in `pico_shim/`. Those files are `audio_pipeline`, `usb_audio`, `dsp_pipeline`, `crossover`, `loudness`, `crossfeed`, `leveller`, `psybass`, `subharm`, `tube`, `limiter`, `upmix`, `siggen`, `rta`, `rta_fft`, `rta_bass`, `output_latency`, `pdm_generator`, `audio_input`, `adat_output`, `notify` and `bg_job`. Only the Zero 2 W builds it, because `usb_audio.c`'s 24-bit unpack uses `sbfx` and `bfi`, which the ARM1176 lacks.
+
+**How the pieces connect.**
+
+- **Front end.** `z4/main_z4.c` reads the sample rate's worth of frames from the TinyUSB FIFO each millisecond. It decodes them into DSPi's `buf_l` and `buf_r` with `global_preamp_linear`, then calls `process_input_block()`.
+- **Globals.** `z4/z4_globals.c` defines what DSPi's `main.c` and `flash_storage.c` would normally provide.
+- **`usb_audio.c`.** It is compiled for its globals, with its UAC1 hook renamed so it is never registered.
+- **Output.** The S/PDIF and I2S output rings are the real pico-extras structures. Each enabled ring is drained at the sample rate by the system timer, which stands in for an audio output until Z5.
+- **Single core.** Core 1 stays off, so every output runs on the single-core path.
+- **Init.** The sequence follows DSPi's `core0_init` without the hardware parts. There is no preset load, so factory defaults apply, including -20 dB master volume.
+- **Pending.** Vendor commands, bulk params and the EQ update path come in Z4b.
+- **Counters.** Vendor request `0x4F` now returns version 2 (204 bytes). It adds `cpu0_load` and block timing, peaks, clip flags and output-ring fill.
+
+**Lost packets with data every microframe.** In the first run only about 5970 of 8000 packets a second arrived, about 25% of the audio. TinyUSB re-arms the data endpoint from `tud_task()` in the main loop, and a 300 us DSP block let two or three 125 us microframes pass with the endpoint unarmed. Data now goes every 1 ms (`bInterval` 4), which gives a block up to 1 ms. This needed the OUT half of patch 2. An enabled OUT endpoint keeps the parity it was enabled with, so while the host's parity is unknown, the SOF handler disables and re-queues the untouched transfer every 16 microframes. Each new queue takes the other parity, and the first packet that lands fixes it.
+
+**Results on the Zero 2 W (2026-11-11).**
+
+- **UAC2 alone, 1 ms data.** 10 of 10 restarts passed at 1000.0 packets per second and 192000 bytes per second, with feedback at about 1002 per second and 0 underruns. The interrupt rate fell from about 15000 to about 1550 per second of streaming.
+- **Z4a, 10 of 10 restarts.** All passed with the same figures. DSPi's input peak was 3275 (a -20 dBFS tone) and its output peak 327 (factory master volume -20 dB).
+- **Load.** DSPi reported `cpu0_load` 35%, with 339.8 us per block on average and 387 us at most, for 47.5 frames. That is single core with the D-cache off, so every access goes to SDRAM. It is the first load figure on the Cortex-A53, not a tuned one.
+
+**Possible DSPi bug found here (not changed, `firmware/DSPi` is read-only for the port).**
+
+- **The bug.** `db_to_vol[]` (`usb_audio.c:480`) is `uint16_t`, and its last entry, for 0 dB, is `0x8000`. `audio_set_volume()` stores it into `int16_t audio_state.vol_mul` (`usb_audio.c:510`, `usb_audio.h:21`), which makes it -32768. The pipeline scales `vol_mul` by 1/32768 (`audio_pipeline.c:348`).
+- **The effect.** At 0 dB host volume the gain would be -1.0, which inverts polarity, and the ramp from the 59 to the 60 step would pass through zero.
+- **Scope.** It would affect the RP boards too.

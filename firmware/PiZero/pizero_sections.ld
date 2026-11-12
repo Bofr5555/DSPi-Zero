@@ -6,6 +6,7 @@ SECTIONS
         KEEP(*(.text.boot))
         KEEP(*(.text.vectors))
         *(.text .text.*)
+        *(.time_critical*)      /* Pico SDK RAM-placement sections (z4 pico_shim) */
     } > RAM
 
     .rodata : ALIGN(8) {
@@ -33,6 +34,7 @@ SECTIONS
     .bss (NOLOAD) : ALIGN(8) {
         __bss_start = .;
         *(.bss .bss.*)
+        *(.slot_rings)          /* DSPi's output slot rings (z4) */
         *(COMMON)
         . = ALIGN(8);
         __bss_end = .;

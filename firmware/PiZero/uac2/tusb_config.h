@@ -41,8 +41,8 @@
 #define CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX  3
 #define CFG_TUD_AUDIO_ENABLE_EP_OUT                 1
 #define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SZ_MAX          UAC2_EP_OUT_SIZE
-// Room for 32 of the largest microframe packets (4 ms). FIFO-count feedback holds it about half full.
-#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (32 * UAC2_EP_OUT_SIZE)
+// Room for 8 of the largest 1 ms packets. FIFO-count feedback holds it about half full.
+#define CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ       (8 * UAC2_EP_OUT_SIZE)
 
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_EP            1
 #define CFG_TUD_AUDIO_ENABLE_FEEDBACK_FORMAT_CORRECTION 0

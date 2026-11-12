@@ -120,6 +120,8 @@ Bring in the RP2350 float pipeline, the vendor command dispatcher and bulk param
 
 DSPi Console will need a small patch to name the new platform. The STM32 port needed that in three places in the Console source.
 
+**Status (2026-11-11): Z4a done on the Zero 2 W (pipeline only).** DSPi's unchanged float pipeline ran on the UAC2 stream through 10 stream restarts with no lost audio. DSPi reported `cpu0_load` 35%, with blocks averaging 340 us for 1 ms of audio. That is single core with the D-cache off, so it is a starting figure, not a tuned one. Z4b brings in vendor commands, bulk params and DSPi Console, with a new platform ID. Details are in `PiZero_Z0_bringup.md` section 15.
+
 ### Z5. Stereo I2S out (listening test)
 
 Drive the PCM block as I2S master into the DAC module, clocked from PLLD through the clock manager's fractional divider. This clock has jitter, which is acceptable for bring-up. Replace the timer pacing with PCM DMA consumption, and derive the USB feedback from it.

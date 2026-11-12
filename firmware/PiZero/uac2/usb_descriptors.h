@@ -24,11 +24,12 @@
 #define UAC2_ENTITY_OUTPUT_TERMINAL 0x03
 #define UAC2_ENTITY_CLOCK           0x04
 
-// Data goes every microframe (bInterval 1), TinyUSB's own DWC2 path for iso OUT: this controller fixes
-// an OUT endpoint's frame parity when it is enabled, so a 1 ms interval would need parity found by trial.
+// Data goes once per millisecond (bInterval 4 at High Speed). TinyUSB re-arms the endpoint from
+// tud_task(), so this gives a DSP block up to 1 ms before a packet is lost; every microframe left
+// only 125 us. The patched DWC2 driver finds the host's frame parity for it (bring-up doc section 14).
 // Largest packet: 96 kHz, 3-byte samples, stereo, plus one frame of jitter.
-#define UAC2_DATA_INTERVAL      0x01
-#define UAC2_EP_OUT_SIZE        ((96000 / 8000 + 1) * 3 * 2)
+#define UAC2_DATA_INTERVAL      0x04
+#define UAC2_EP_OUT_SIZE        ((96000 / 1000 + 1) * 3 * 2)
 
 #define UAC2_AS_ALT_LEN (TUD_AUDIO_DESC_STD_AS_INT_LEN + TUD_AUDIO_DESC_CS_AS_INT_LEN \
     + TUD_AUDIO_DESC_TYPE_I_FORMAT_LEN + TUD_AUDIO_DESC_STD_AS_ISO_EP_LEN \

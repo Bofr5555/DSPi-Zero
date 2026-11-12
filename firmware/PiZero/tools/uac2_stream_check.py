@@ -21,7 +21,7 @@ FIELDS = ("class_requests", "set_alt_count", "rate_sets", "reserved0", "fb_sent"
           "out_packets", "out_bytes", "consumed_bytes", "underruns", "fifo_level", "suspends", "resumes",
           "mounts", "irqs", "irq_spurious", "fb_diepctl", "fb_dieptsiz", "fb_diepint", "data_doepctl", "gintmsk",
           "dsts", "fb_busy", "fb_parity", "data_parity")
-# Data goes every microframe (about 8000 packets/s), but with feedback working the host varies the
+# Data goes once per millisecond (about 1000 packets/s), but with feedback working the host varies the
 # frames per packet, so the data is judged by bytes/s against the sample rate rather than packet count.
 SPEEDS = {0: "Full", 1: "Low", 2: "High"}
 
@@ -37,7 +37,7 @@ def find_board():
 
 
 def read_stats(dev):
-    raw = bytes(dev.ctrl_transfer(0xC0, REQ_Z_GET_STATS, 0, 0, 128, timeout=500))
+    raw = bytes(dev.ctrl_transfer(0xC0, REQ_Z_GET_STATS, 0, 0, 256, timeout=500))
     magic, version, uptime_ms, rate, alt, mounted, speed, _ = struct.unpack_from("<HHIIBBBB", raw)
     if magic != 0x5532:
         return None
@@ -46,6 +46,15 @@ def read_stats(dev):
     for k in ("fb_parity", "data_parity"):
         if k in s and s[k] >= 0x80000000:
             s[k] -= 1 << 32
+    if version >= 2 and len(raw) >= 204:   # Z4: DSPi pipeline block at byte 116
+        cpu0, cpu1, core1_mode, nch = struct.unpack_from("<BBBB", raw, 116)
+        blocks, frames, us_last, us_max, us_avg100, clip = struct.unpack_from("<6I", raw, 120)
+        peaks = struct.unpack_from("<18H", raw, 144)
+        fill, target, drops, under_f, drop_f, prate = struct.unpack_from("<iIIIII", raw, 180)
+        s.update(cpu0=cpu0, cpu1=cpu1, core1_mode=core1_mode, n_channels=nch, blocks=blocks, frames=frames,
+                 block_us_last=us_last, block_us_max=us_max, block_us_avg=us_avg100 / 100, clip_flags=clip,
+                 peaks=peaks, slot0_fill=fill, ring_target=target, ring_drops=drops,
+                 slot0_underrun_frames=under_f, slot0_drop_frames=drop_f, pipeline_rate=prate)
     s.update(version=version, uptime_ms=uptime_ms, rate=rate, alt=alt, mounted=mounted, speed=speed)
     return s
 
@@ -136,6 +145,11 @@ def main():
               f"feedback sent {s['fb_sent']}, FIFO {s['fifo_level']} bytes, underruns +{under}, "
               f"IRQs {s['irqs']}", flush=True)
         steady_underruns = s["underruns"]
+        if "cpu0" in s:
+            print(f"    DSPi: cpu0 {s['cpu0']}%, block {s['block_us_avg']:.1f} us avg / {s['block_us_max']} us max for "
+                  f"{s['frames'] / max(s['blocks'], 1):.1f} frames, blocks {s['blocks']}, slot0 fill {s['slot0_fill']} "
+                  f"(target {s['ring_target']}), ring drops {s['ring_drops']}, underrun frames "
+                  f"{s['slot0_underrun_frames']}, peaks in {s['peaks'][:2]} out {s['peaks'][8:10]}", flush=True)
         print(f"    EP2 IN DIEPCTL {s['fb_diepctl']:08x} DIEPTSIZ {s['fb_dieptsiz']:08x} busy {s['fb_busy']} "
               f"parity {s['fb_parity']}; EP1 OUT DOEPCTL {s['data_doepctl']:08x} parity {s['data_parity']}; "
               f"GINTMSK {s['gintmsk']:08x}", flush=True)

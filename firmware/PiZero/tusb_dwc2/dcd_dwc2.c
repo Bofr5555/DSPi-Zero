@@ -248,6 +248,7 @@ static void dfifo_device_init(uint8_t rhport) {
 //--------------------------------------------------------------------
 // DSPi PiZero patch 2: frame parity the host uses for each iso endpoint, -1 until a packet goes through.
 static int8_t _iso_parity[2][16];
+static uint16_t _iso_queued_frame[2][16];   // (micro)frame an unlearned iso packet was queued in
 
 // DSPi PiZero: read-only view of the learned parity, for bench diagnostics.
 int8_t dcd_dwc2_iso_parity(uint8_t dir, uint8_t epnum) {
@@ -410,6 +411,7 @@ static void edpt_schedule_packets(uint8_t rhport, const uint8_t epnum, const uin
       depctl.bm.set_data0_iso_even = 1;
     }
     if (learned < 0) {
+      _iso_queued_frame[dir][epnum] = (uint16_t) dwc2->dsts_bm.frame_number;
       dwc2->gintmsk |= GINTMSK_SOFM;
     }
   }
@@ -1094,6 +1096,7 @@ void dcd_int_handler(uint8_t rhport) {
     // DSPi PiZero patch 2: while an iso endpoint's parity is still unknown, hold each parity for 16
     // (micro)frames in turn, and keep the SOF interrupt on until a packet goes through. Following every
     // frame instead fails whenever the host's token comes before this interrupt in the frame.
+    // IN packets are retargeted in place; OUT ones must be disabled and queued again.
     bool iso_unlearned = false;
     for (uint8_t dir = 0; dir < 2; dir++) {
       for (uint8_t n = 1; n < _dwc2_controller[rhport].ep_count; n++) {
@@ -1108,10 +1111,17 @@ void dcd_int_handler(uint8_t rhport) {
         c.value = *ctl;
         if (c.bm.enable && c.bm.type == DEPCTL_EPTYPE_ISOCHRONOUS) {
           const uint32_t odd = (frame >> 4) & 1u;
-          if (c.bm.dpid_iso_odd != odd) {
-            c.bm.set_data0_iso_even = odd ? 0 : 1;
-            c.bm.set_data1_iso_odd = odd ? 1 : 0;
-            *ctl = c.value;
+          if (dir == TUSB_DIR_IN) {
+            if (c.bm.dpid_iso_odd != odd) {
+              c.bm.set_data0_iso_even = odd ? 0 : 1;
+              c.bm.set_data1_iso_odd = odd ? 1 : 0;
+              *ctl = c.value;
+            }
+          } else if (((frame - _iso_queued_frame[dir][n]) & 0x3FFFu) >= 16) {
+            // An enabled OUT endpoint keeps the parity it was enabled with, so re-queue the untouched
+            // transfer: the new queue picks the other parity for the next 16 (micro)frames.
+            edpt_disable(rhport, n, false);
+            edpt_schedule_packets(rhport, n, TUSB_DIR_OUT);
           }
           iso_unlearned = true;
         }

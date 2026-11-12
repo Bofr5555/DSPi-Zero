@@ -205,3 +205,73 @@ add_executable(pizero_uac2 ${PLATFORM_SRC} irq.c uac2/main_uac2.c uac2/usb_descr
 target_include_directories(pizero_uac2 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2)
 target_link_libraries(pizero_uac2 PRIVATE tinyusb_uac2)
 pizero_image(pizero_uac2)
+
+# Z4: DSPi's RP2350 float pipeline on the UAC2 front end. DSPi's sources are compiled unchanged, as
+# RP2350 (PICO_RP2350=1), against stand-in Pico SDK headers in pico_shim/. Received audio is decoded
+# into the pipeline every millisecond and the output rings are drained by the system timer, standing
+# in for the outputs. Loaded over USB (not staged on the SD card). Zero 2 W only, see below.
+if(PIZERO_BOARD STREQUAL "zero2")
+    set(PICO_EXTRAS_DIR ${CMAKE_CURRENT_LIST_DIR}/../pico-extras/src/rp2_common)
+    set(Z4_DSPI_FILES
+        audio_pipeline.c
+        usb_audio.c
+        dsp_pipeline.c
+        crossover.c
+        loudness.c
+        crossfeed.c
+        leveller.c
+        psybass.c
+        subharm.c
+        tube.c
+        limiter.c
+        upmix.c
+        siggen.c
+        rta.c
+        rta_fft.c
+        rta_bass.c
+        output_latency.c
+        pdm_generator.c
+        audio_input.c
+        adat_output.c
+        notify.c
+        bg_job.c
+    )
+    list(TRANSFORM Z4_DSPI_FILES PREPEND ${DSPI_DIR}/ OUTPUT_VARIABLE Z4_DSPI_SRC)
+
+    add_library(dspi_z4 STATIC ${Z4_DSPI_SRC})
+    # uac2 first for its tusb_config.h, then the shim, then DSPi and the real pico-extras output headers.
+    target_include_directories(dspi_z4 BEFORE PUBLIC ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
+    target_include_directories(dspi_z4 PUBLIC
+        ${DSPI_DIR}
+        ${PICO_EXTRAS_DIR}/pico_audio_spdif_multi/include
+        ${PICO_EXTRAS_DIR}/pico_audio_i2s_multi/include
+    )
+    target_compile_definitions(dspi_z4 PUBLIC PICO_RP2350=1)
+    target_link_libraries(dspi_z4 PUBLIC tinyusb_uac2)
+    # DSPi builds hosted (so fabsf, fminf and the like are builtins), with -fcommon and gnu C. Its
+    # warnings are silenced since its sources cannot change here.
+    target_compile_options(dspi_z4 PRIVATE ${COMMON_FLAGS} -fhosted -O2 -g -std=gnu17 -fcommon -w)
+    target_link_libraries(dspi_z4 PUBLIC m)
+    # Per-file optimisation as in firmware/DSPi/CMakeLists.txt.
+    foreach(f usb_audio.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c siggen.c upmix.c adat_output.c)
+        set_property(SOURCE ${DSPI_DIR}/${f} APPEND PROPERTY COMPILE_OPTIONS -O3)
+    endforeach()
+    foreach(f dsp_pipeline.c subharm.c tube.c)
+        set_property(SOURCE ${DSPI_DIR}/${f} APPEND PROPERTY COMPILE_OPTIONS -O3 -ffp-contract=off)
+    endforeach()
+    # usb_audio.c holds the pipeline's globals and usb_sound_card_init(), and also DSPi's UAC1 class
+    # driver. Its driver hook is renamed so the image keeps its own vendor driver, and its tud_init()
+    # becomes a no-op because main_z4.c brings USB up itself.
+    set_property(SOURCE ${DSPI_DIR}/usb_audio.c APPEND PROPERTY COMPILE_DEFINITIONS
+        usbd_app_driver_get_cb=dspi_uac1_driver_get_cb
+        tud_rhport_init=dspi_z4_tud_rhport_init
+    )
+
+    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c z4/main_z4.c z4/z4_globals.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
+    target_include_directories(pizero_z4 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
+    target_link_libraries(pizero_z4 PRIVATE dspi_z4 tinyusb_uac2)
+    pizero_image(pizero_z4)
+else()
+    # ARM1176 cannot assemble usb_audio.c's RP2350 24-bit unpack (inline sbfx/bfi need ARMv6T2).
+    message(STATUS "pizero_z4 is built for PIZERO_BOARD=zero2 only")
+endif()
