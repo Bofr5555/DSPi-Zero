@@ -261,6 +261,17 @@ uint32_t smi_out_frames(void) {
     return f;
 }
 
+// For USB feedback: consumption in slot-0 I2S ring words (2 a frame), word-precise from the DMA position.
+uint32_t smi_out_words2(void) {
+    uint32_t save = irq_global_disable();
+    if (st.running) {
+        track();
+    }
+    uint32_t w = st.frames * 2u + word_rem / (SMI_FRAME_WORDS / 2u);
+    irq_global_restore(save);
+    return w;
+}
+
 uint32_t smi_out_composed(void) {
     return st.composed;     // one word, written only by the DMA interrupt
 }

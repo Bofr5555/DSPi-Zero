@@ -606,7 +606,7 @@ Fixed values set with bench request `0x48` showed why:
 | Per 1 ms, +500 ppm | +83.0 bytes/s |
 | Per 1 ms, -500 ppm | -85.0 bytes/s |
 
-macOS reads the value in samples per data-endpoint service interval: 1 ms here, with `bInterval` 4. `main_z4.c` now sets the feedback itself in those units. It is nominal plus a proportional term on the smoothed FIFO level, which held the FIFO within about 100 bytes of half full. Linux detects the feedback scale by its size. How Windows reads it at this `bInterval` is not yet checked.
+macOS reads the value in samples per data-endpoint service interval: 1 ms here, with `bInterval` 4. Linux detects the feedback scale by its size. How Windows reads it at this `bInterval` is not yet checked. The first fix was a proportional term on the TinyUSB FIFO level; section 20 replaces it with DSPi's own controller.
 
 ### Results
 
@@ -624,4 +624,35 @@ macOS reads the value in samples per data-endpoint service interval: 1 ms here, 
 - MCK, the ADAT output, and which pins they take.
 - Windows' reading of the feedback value.
 - Moving the composer to a second core, if the load matters at 96 kHz.
+
+## 20. USB feedback: DSPi's controller, and no FIFO latency
+
+*Added: 2026-11-12*
+
+The feedback now comes from DSPi's own controller (`usb_feedback_controller.c`, unchanged), and the TinyUSB FIFO no longer holds a buffer.
+
+**Why.** The section 19 controller held the TinyUSB FIFO half full: about 12 ms of latency at 16-bit, 48 kHz (582 frames), on top of the slot rings. It also had no rate measurement, so it could reach the right rate only with a standing FIFO error, and a consumer servo held the slot fill separately. DSPi's controller does both jobs properly. Loop A measures the output rate against the host's 1 ms frames over an 8 to 16 s window. Loop B servos slot 0's fill to DSPi's target with a two-slope proportional term. It works in 16.16 samples per 1 ms, which is exactly the unit macOS reads at High Speed with our 1 ms data interval.
+
+**Formats.** On the RP2350 the controller also works in 16.16. Only the value on the wire is rounded to 10.14 (`fb_ctrl_get_10_14()`), because a Full Speed feedback endpoint is 3 bytes. The Pi is at High Speed with a 4-byte endpoint, so it sends the 16.16 value with no rounding: one step is 1/65536 sample per ms, 0.3 ppm at 48 kHz. DSPi's `feedback_10_14` is still kept up to date for its own status reports.
+
+**How it is fed.**
+
+- **No 8 kHz interrupt.** On the RP2350, DSPi's SOF interrupt calls `fb_ctrl_sof_update()` every 1 ms. At High Speed a SOF interrupt would come every 125 µs microframe. Instead, `feedback_measure()` runs from the USB interrupt, which arrives at least once a millisecond, and acts once per new 1 ms frame. That frame is DSTS SOFFN >> 3.
+- **Word-precise rate.** It latches the frame number with the SMI's consumption from the DMA position, in slot-0 I2S ring words (2 a frame, `rate_shift` 13). That is word-precise, not the composer's 16-frame steps.
+- **Fill.** The fill comes from slot 0's snapshot pair, as on the RP2350. That is the fill just after each write, so it reads 15 to 30 frames above a random-moment sample.
+- **Sending.** `feedback_send()` in the main loop sends the controller's value, nominal while another input is selected (as DSPi does), or the bench override from request `0x48`.
+
+**Consumer.** `consume_task()` now drains everything the host has delivered into the pipeline on every main-loop pass, so the slot rings are the only buffer. When a stream opens, it first collects DSPi's fill target (scaled if the rate is about to change), so the rings start at target. The `underruns` count in the `0x4F` stats now means a gap of 3 ms or more with no data while streaming, since an empty FIFO is normal. The section 19 consumer servo and FIFO-level loop are gone. Stats version 8 (372 bytes) adds the controller's internals, which `smi_check.py --watch` prints.
+
+**Results** (`smi_check.py --watch 30` at each rate, `uac2_stream_check.py 3`).
+
+| Rate | Long-window rate | Divider offset | Fill error after 30 s | FIFO |
+|---|---|---|---|---|
+| 48 kHz | +64.8 to +65.8 ppm | +64 ppm | -4 frames | 0, or one packet |
+| 96 kHz | +65.5 to +65.8 ppm | +64 ppm | -6 frames | 0 to 384 bytes |
+| 44.1 kHz | +78.7 ppm | +101 ppm predicted, unexplained | -0.5 frames | 0 |
+
+There were no slot underruns, ring drops, host gaps or late compositions, and the restart cycles passed. Latency is now DSPi's fill target (192 frames, 4 ms at 48 kHz) plus the composer's lead of about 1.3 ms, down from about 17 ms.
+
+**Settling.** DSPi's inner servo gain is deliberately gentle, 1/256 sample a millisecond per 48-frame bucket, so packet jitter stays out of the host's clock. A 30-frame fill error after a pipeline reset (a slot type switch, for example) takes about 30 s to clear, with no underruns on the way. That tuning is kept.
 

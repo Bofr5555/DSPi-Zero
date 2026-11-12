@@ -23,11 +23,14 @@ PREAMBLES = {"X": 0b11001001, "Y": 0b01101001, "Z": 0b00111001}
 
 
 def smi_stats(dev):
-    raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 348, timeout=500))
+    raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 372, timeout=500))
     s = read_stats(dev)
     if s["version"] < 7:
         raise SystemExit(f"FAIL: stats version {s['version']}, need 7 (load the SMI pizero_z4.img)")
     d = dict(zip(SMI_FIELDS, struct.unpack_from("<12I", raw, 300)))
+    fb = struct.unpack_from("<4I2i", raw, 348) if len(raw) >= 372 else None
+    if fb:
+        d.update(fb_sent=fb[0], fb_rate_iir=fb[1], fb_rate_long=fb[2], fb_servo=fb[3], fb_fill_err=fb[4])
     d["s"] = s
     return d
 
@@ -88,13 +91,51 @@ def get_type(dev, slot):
     return dev.ctrl_transfer(0xC1, REQ_GET_OUTPUT_TYPE, slot, VENDOR_IFACE, 1)[0]
 
 
+def classify(words, bit):
+    """What a slot's pin carries: S/PDIF if subframes decode, I2S if data words frame on BCK, else idle."""
+    if len({w >> bit & 1 for w in words}) == 1:
+        return "idle"
+    sp = decode_spdif(words, bit)
+    if len(sp) >= 28 and all(g[2] for g in sp):
+        return "S/PDIF"
+    if any(w >> BCK & 1 for w in words) and len(decode_i2s(words, bit)) >= 28:
+        return "I2S"
+    return "unrecognised"
+
+
+def observe():
+    dev = find_board()
+    if dev is None:
+        print("FAIL: no DSPi Zero")
+        return 1
+    want = ["I2S" if get_type(dev, s) else "S/PDIF" for s in range(4)]
+    _, words = snapshot(dev)
+    bck = any(w >> BCK & 1 for w in words)
+    ok = True
+    for slot in range(4):
+        got = classify(words, slot)
+        match = got == want[slot]
+        ok &= match
+        print(f"slot {slot + 1} (outputs {2 * slot + 1}-{2 * slot + 2}, GPIO {8 + slot}): DSPi type {want[slot]:6s}, "
+              f"pin carries {got:12s} {'ok' if match else 'MISMATCH'}")
+    print(f"I2S clocks (GPIO 12, 13): {'running' if bck else 'stopped'}, "
+          f"{'as expected' if bck == ('I2S' in want) else 'NOT as expected'}")
+    ok &= bck == ("I2S" in want)
+    print("PASS: every slot's pin matches its type in DSPi" if ok else "FAIL")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--types", default="i2s,spdif,i2s,spdif")
     ap.add_argument("--rate", type=int, default=48000)
     ap.add_argument("--keep", action="store_true", help="leave the slot types as tested")
     ap.add_argument("--watch", type=float, default=0, help="then watch fill and underruns for this many seconds")
+    ap.add_argument("--observe", action="store_true",
+                    help="change nothing: compare each slot's type in DSPi with what its pin carries")
     args = ap.parse_args()
+    if args.observe:
+        return observe()
     types = [1 if t.strip() == "i2s" else 0 for t in args.types.split(",")]
     dev = find_board()
     if dev is None:
@@ -142,6 +183,12 @@ def main():
                   f"frames +{q['slot0_underrun_frames'] - p['slot0_underrun_frames']}, ring drops "
                   f"+{q['ring_drops'] - p['ring_drops']}, USB underruns +{q['underruns'] - p['underruns']}, FIFO "
                   f"{q['fifo_level']}, composer late +{c['late'] - prev['late']}", flush=True)
+            if "fb_sent" in c:
+                nom = c["freq"] / 1000 * 65536
+                ppm = lambda v: (v / nom - 1) * 1e6 if v else float("nan")
+                print(f"           feedback {ppm(c['fb_sent']):+7.1f} ppm (rate short {ppm(c['fb_rate_iir']):+7.1f}, long "
+                      f"{ppm(c['fb_rate_long']):+7.1f}, servo {c['fb_servo'] / nom * 1e6:+7.1f}), fill error "
+                      f"{c['fb_fill_err'] / 65536 * 48:+6.1f} frames", flush=True)
             if q["slot0_underrun_frames"] != p["slot0_underrun_frames"] or q["underruns"] != p["underruns"]:
                 failures.append(f"underruns at {(q['uptime_ms'] - b['s']['uptime_ms']) / 1000:.0f} s")
             prev = c

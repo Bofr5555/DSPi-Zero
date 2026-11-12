@@ -48,8 +48,11 @@ uint32_t tusb_time_millis_api(void) {
     return board_micros() / 1000u;
 }
 
+static void feedback_measure(void);
+
 static void usb_irq(void) {
     tud_int_handler(0);
+    feedback_measure();
     // Read back from the controller so its interrupt-clear writes have landed before we return.
     // Otherwise the line is still high and the IRQ fires again with nothing pending.
     (void)*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + 0x014);    // GINTSTS
@@ -140,13 +143,19 @@ typedef struct {
     pcm_out_status_t pcm;           // version 5: the PCM block (Z5 I2S out)
     uint32_t output_clock;          // shim_output_clock(), frames
     smi_out_status_t smi;           // version 7: the SMI output stream
+    uint32_t fb_sent_q16;           // version 8: the feedback value sent, 16.16 samples per 1 ms
+    uint32_t fb_rate_iir_q16;       // DSPi's controller: short-window rate
+    uint32_t fb_rate_long_q16;      // long-window rate, 0 until valid
+    int32_t fb_servo_q16;           // fill servo term
+    int32_t fb_fill_err_q16;        // filtered slot 0 fill error, in 48-frame buckets
+    uint32_t fb_updates;
 } z4_stats_t;
 
 int8_t dcd_dwc2_iso_parity(uint8_t dir, uint8_t epnum);
 #define DWC2_R(off) (*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + (off)))
 
 static volatile u2_stats_t stats;
-static uint32_t fb_override;    // feedback_task(): bench-fixed feedback value, 0 for automatic
+static uint32_t fb_override;    // feedback_send(): bench-fixed feedback value, 0 for automatic
 static uint32_t fb_value;
 
 static volatile bool reboot_requested;
@@ -311,7 +320,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedback_params_t *feedback_param) {
     (void)func_id;
     (void)alt_itf;
-    // feedback_task() below sets the feedback itself, from how full TinyUSB's FIFO is.
+    // feedback_send() below sets the feedback from DSPi's own controller.
     feedback_param->method = AUDIO_FEEDBACK_METHOD_DISABLED;
     feedback_param->sample_freq = current_rate;
 }
@@ -470,7 +479,7 @@ typedef struct {
 // Wire layout read by the bench tools: version 1 fields unchanged, the DSPi block appended.
 _Static_assert(offsetof(u2_reply_t, dspi) == 116, "0x4F reply: DSPi block offset");
 _Static_assert(offsetof(z4_stats_t, peaks) == 28 && offsetof(z4_stats_t, slot0_fill) == 64, "0x4F reply layout");
-_Static_assert(sizeof(u2_reply_t) == 348, "0x4F reply size");
+_Static_assert(sizeof(u2_reply_t) == 372, "0x4F reply size");
 
 static void fill_dspi_stats(z4_stats_t *z) {
     memset(z, 0, sizeof(*z));
@@ -514,6 +523,12 @@ static void fill_dspi_stats(z4_stats_t *z) {
     pcm_out_status(&z->pcm);
     z->output_clock = shim_output_clock();
     smi_out_status(&z->smi);
+    z->fb_sent_q16 = fb_value;
+    z->fb_rate_iir_q16 = fb_ctrl.rate_estimate_q16;
+    z->fb_rate_long_q16 = fb_ctrl.long_valid ? fb_ctrl.rate_long_q16 : 0;
+    z->fb_servo_q16 = fb_ctrl.servo_q16;
+    z->fb_fill_err_q16 = fb_ctrl.fill_error_filtered;
+    z->fb_updates = fb_ctrl.diag_updates;
 }
 
 bool dspi_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req);
@@ -611,7 +626,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
             return true;
         }
         reply.magic = U2_STATS_MAGIC;
-        reply.version = 7;
+        reply.version = 8;
         reply.uptime_ms = board_micros() / 1000u;
         reply.rate = current_rate;
         reply.alt = current_alt;
@@ -754,62 +769,80 @@ static void stream_start(void) {
     dspi_us_total = 0;
 }
 
-// Feedback in 16.16 samples per data-endpoint service interval (2^(bInterval-1) microframes, 1 ms here),
-// which is how macOS reads it: a per-microframe value (TinyUSB's FIFO-count method) is out of range and
-// ignored, so the host runs at nominal. Bring-up doc section 19 has the measurement. The value is
-// nominal plus a proportional term on the smoothed FIFO level. Bench request 0x48 can fix it.
-#define FB_UFRAMES (1u << (UAC2_DATA_INTERVAL - 1u))
-#define FB_GAIN 6                   // 16.16 units per byte below half full: 64 ppm costs about 35 bytes
+// USB feedback: DSPi's own controller (usb_feedback_controller.c), unchanged. It measures the output rate
+// against the host's 1 ms frames over an 8-16 s window and servos slot 0's fill to DSPi's target, all in
+// 16.16 samples per 1 ms. That is also the unit macOS reads at High Speed with a 1 ms data interval
+// (bring-up section 19), so its value is sent as is, with no 10.14 rounding.
 
-static void feedback_task(uint16_t level) {
-    static uint32_t avg_q8;     // FIFO level, bytes, 8 fractional bits
-    uint32_t half = CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ / 2;
-    if (avg_q8 == 0) {
-        avg_q8 = half << 8;
+extern audio_spdif_instance_t *spdif_instance_ptrs[];
+extern volatile bool output_type_switch_in_progress;
+
+// From the USB interrupt, once per new 1 ms frame: the frame number and the SMI's consumption, latched
+// together, and slot 0's fill from its ring's snapshot pair. The DMA count is word-precise, unlike the
+// composer's 16-frame steps. This replaces DSPi's SOF hook without an 8 kHz microframe interrupt.
+static void feedback_measure(void) {
+    static uint32_t last_frame = 0xFFFFu;
+    if (current_alt == 0 || output_type_switch_in_progress) {
+        return;
     }
-    avg_q8 = avg_q8 - (avg_q8 >> 6) + ((uint32_t)level << 2);     // about 64 ticks
-    uint32_t nominal = (uint32_t)(((uint64_t)current_rate << 16) * FB_UFRAMES / 8000u);
-    int32_t fb = (int32_t)nominal + ((int32_t)(half << 8) - (int32_t)avg_q8) * FB_GAIN / 256;
-    int32_t span = (int32_t)(nominal / 100u);   // at most 1% either way
-    if (fb > (int32_t)nominal + span) {
-        fb = (int32_t)nominal + span;
-    } else if (fb < (int32_t)nominal - span) {
-        fb = (int32_t)nominal - span;
+    uint32_t frame = (DWC2_R(0x808) >> 11) & 0x7FFu;    // DSTS SOFFN: frame << 3 | microframe at HS
+    if (frame == last_frame) {
+        return;
     }
-    fb_value = fb_override ? fb_override : (uint32_t)fb;
-    tud_audio_fb_set(fb_value);
+    last_frame = frame;
+    uint32_t words = smi_out_words2();
+    uint32_t fill_frames = 0;
+    if (output_types[0] == OUTPUT_TYPE_I2S) {
+        audio_i2s_instance_t *inst = i2s_instance_ptrs[0];
+        if (inst && inst->ring) {
+            fill_frames = inst->snap_produced_frames - inst->snap_consumed_frames;
+        }
+    } else {
+        audio_spdif_instance_t *inst = spdif_instance_ptrs[0];
+        if (inst && inst->ring) {
+            fill_frames = inst->snap_produced_frames - inst->snap_consumed_frames;
+        }
+    }
+    if ((int32_t)fill_frames < 0) {
+        fill_frames = 0;
+    }
+    fb_ctrl_sof_update(&fb_ctrl, frame, words, 13, (fill_frames << 16) / SLOT_FILL_FRAMES_PER_BUCKET,
+                       (output_ring_target_frames << 16) / SLOT_FILL_FRAMES_PER_BUCKET);
 }
 
-// While another input is selected the host's stream is drained and dropped, as DSPi ignores it.
-// Each 1 ms tick takes as many frames as the output clock advanced: the DAC's own rate while the PCM
-// block plays, so the FIFO level, and with it the host's feedback, follows the DAC.
+// From the main loop: sends the controller's value, nominal while another input is selected (as DSPi
+// does), or the bench override. DSPi's 10.14 copy is kept for its own status reports.
+static void feedback_send(void) {
+    uint32_t nominal = nominal_feedback_10_14 << 2;
+    uint32_t fb = fb_ctrl.feedback_out_q16 ? fb_ctrl.feedback_out_q16 : nominal;
+    if (active_input_source != INPUT_SOURCE_USB) {
+        fb = nominal;
+    }
+    if (fb_override) {
+        fb = fb_override;
+    }
+    feedback_10_14 = (fb + 2u) >> 2;
+    if (fb != fb_value) {
+        fb_value = fb;
+        tud_audio_fb_set(fb);
+    }
+}
+
+// Everything the host has delivered goes into the pipeline as soon as it lands, so the TinyUSB FIFO stays
+// near empty and the slot rings are the only buffer, which the feedback holds at DSPi's target. While
+// another input is selected the host's stream is drained and dropped, as DSPi ignores it.
 static void consume_task(void) {
-    static uint32_t last_us;
-    static uint32_t last_clk;   // shim_output_clock() at the last tick
     static bool running;
     static bool busy;
+    static uint32_t last_data_us;
+    static bool in_gap;
 
     if (busy) {
         return;     // a stream restart is settling the pipeline from in here
     }
-    uint32_t now = board_micros();
-    if (now - last_us < 1000u) {
-        return;
-    }
-    last_us = now;
-    uint32_t clk = shim_output_clock();
-    uint32_t frames = clk - last_clk;
-    last_clk = clk;
-    if (frames > current_rate / 100u) {
-        frames = current_rate / 1000u;  // first tick, or the loop was held up: do not try to catch up
-    }
-
     uint8_t alt = current_alt;
     uint16_t level = tud_audio_available();
     stats.fifo_level = level;
-    if (current_alt != 0) {
-        feedback_task(level);
-    }
     bool usb_source = active_input_source == INPUT_SOURCE_USB;
     if (alt == 0) {
         if (running) {
@@ -819,41 +852,39 @@ static void consume_task(void) {
         consumer_running = false;
         return;
     }
+    feedback_send();
+    uint32_t bytes_per_frame = 2u * (alt == 1 ? 2u : 3u);
+    uint32_t now = board_micros();
     if (!running) {
-        if (level < CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ / 2) {
+        // Collect DSPi's fill target (scaled if the rate is about to change) before starting, so the
+        // first drain puts the slot rings at target and the feedback only has to hold them there.
+        uint32_t target = output_ring_target_frames;
+        if (audio_state.freq && audio_state.freq != current_rate) {
+            target = (uint32_t)((uint64_t)target * current_rate / audio_state.freq);
+        }
+        if (level < target * bytes_per_frame) {
             return;
         }
         running = true;
         busy = true;
         stream_start();
         busy = false;
-        last_us = board_micros();
-        last_clk = shim_output_clock();
-        frames = current_rate / 1000u;
+        last_data_us = board_micros();
     } else if (usb_source && audio_state.freq != current_rate) {
         busy = true;
         stream_start();     // the host changed rate without closing the stream
         busy = false;
-        last_us = board_micros();
-        last_clk = shim_output_clock();
-        frames = current_rate / 1000u;
+        last_data_us = board_micros();
     }
     consumer_running = usb_source;
 
-    uint32_t bytes_per_frame = 2u * (alt == 1 ? 2u : 3u);
-    // Nothing else steers the slot fill (on the RP2350, DSPi's feedback does), so nudge it towards DSPi's
-    // target by up to 2 frames a tick. The FIFO absorbs the difference and the feedback re-centres it.
-    // The fill is read before this tick's write, so half the write is added to servo the mid-block fill.
-    if (usb_source) {
-        int32_t mid = output_ring_fill_signed(0) + (int32_t)frames / 2;
-        int32_t corr = ((int32_t)output_ring_target_frames - mid) / 16;
-        corr = corr > 2 ? 2 : (corr < -2 ? -2 : corr);
-        frames = (int32_t)frames + corr > 0 ? (uint32_t)((int32_t)frames + corr) : 0u;
-    }
-    uint32_t avail = level / bytes_per_frame;
-    if (avail < frames) {
-        stats.underruns++;
-        frames = avail;
+    uint32_t frames = level / bytes_per_frame;
+    if (frames) {
+        last_data_us = now;
+        in_gap = false;
+    } else if (!in_gap && now - last_data_us >= 3000u) {
+        stats.underruns++;  // the host delivered nothing for 3 ms while streaming
+        in_gap = true;
     }
     // At most one producer block per pipeline call (output_latency.c's cap, 192 at most).
     while (frames) {

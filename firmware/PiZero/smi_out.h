@@ -34,6 +34,7 @@ bool smi_out_start(uint16_t *ring, uint32_t ring_frames, uint32_t freq, uint32_t
 void smi_out_set_rate(uint32_t freq);
 uint32_t smi_out_frames(void);      // frames the DMA has read; safe from any context
 uint32_t smi_out_composed(void);    // frames composed so far, the reader position of the slot rings
+uint32_t smi_out_words2(void);      // frames the DMA has read, times 2, to 1/128 frame: I2S ring words
 void smi_out_status(smi_out_status_t *out);
 
 // Bench probe: samples GPIO gpio's level for ms milliseconds and returns the number of level changes.
