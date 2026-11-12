@@ -10,6 +10,8 @@
 #define PASSWD (0x5Au << 24)
 #define CM_PCMCTL (CPRMAN + 0x098u)
 #define CM_PCMDIV (CPRMAN + 0x09cu)
+#define CM_SMICTL (CPRMAN + 0x0b0u)
+#define CM_SMIDIV (CPRMAN + 0x0b4u)
 #define CM_V3DCTL (CPRMAN + 0x038u)
 #define CM_V3DDIV (CPRMAN + 0x03cu)
 #define CM_TCNTCTL (CPRMAN + 0x0c0u)
@@ -52,7 +54,7 @@ static const row_t rows[PLL_ROW_COUNT] = {
 };
 
 static pll_out_status_t st = {.magic = PLL_OUT_MAGIC, .unlock_first_us = 0xFFFFFFFFu};
-static bool fw_saved, counter_claimed, prev_set;
+static bool fw_saved, counter_claimed, prev_set, per_held, in_use;
 static volatile uint32_t pending_row = 0xFFFFFFFFu;
 static volatile uint32_t pending_mux = 0xFFFFFFFFu, pending_osc;
 static uint32_t write_us, count_start_us;
@@ -95,10 +97,19 @@ static void write_multiplier(uint32_t ndiv, uint32_t frac) {
     wr(A2W_PLLA_CTRL, ctrl);
 }
 
+// A move between rows with the same PER divider, with the channel already running, is made live: the
+// PLL slews to the new rate and the channel keeps its clock. Anything else holds the channel.
+static bool needs_hold(uint32_t row) {
+    return row == PLL_ROW_FIRMWARE || !active || active->per_div != rows[row].per_div ||
+           (rd(A2W_PLLA_PER) & CHANNEL_DISABLE) || (rd(CM_PLLA) & HOLDPER);
+}
+
 static void retune(uint32_t row) {
     save_firmware_values();
-    // Hold the PER channel while the VCO moves. The other hold bits stay as the firmware set them.
-    wr(CM_PLLA, (rd(CM_PLLA) & ~LOAD_BITS) | HOLDPER);
+    per_held = needs_hold(row);
+    if (per_held) {     // the other hold bits stay as the firmware set them
+        wr(CM_PLLA, (rd(CM_PLLA) & ~LOAD_BITS) | HOLDPER);
+    }
     if (row == PLL_ROW_FIRMWARE) {
         write_multiplier(st.fw_ctrl & NDIV_MASK, st.fw_frac & FRAC_MASK);
         active = 0;
@@ -167,7 +178,10 @@ static void lock_wait_step(bool spin) {
         return;
     }
     st.state = PLL_LOCKED;
-    release_per();
+    if (per_held) {
+        release_per();
+        per_held = false;
+    }
 }
 
 static void count_start(uint32_t mux, uint32_t osc) {
@@ -196,6 +210,42 @@ static void count_step(void) {
         st.count_state = COUNT_TIMEOUT;
         wr(CM_TCNTCTL, 0);
     }
+}
+
+bool pll_out_select(uint32_t row) {
+    if (row == PLL_ROW_FIRMWARE || row >= PLL_ROW_COUNT) {
+        return false;
+    }
+    if (active == &rows[row] && st.state == PLL_LOCKED) {
+        return true;
+    }
+    retune(row);
+    if (!per_held) {
+        return true;    // live move; pll_out_poll() records the lock
+    }
+    lock_wait_step(true);
+    while (st.state == PLL_WAITING) {
+        lock_wait_step(false);
+    }
+    return st.state == PLL_LOCKED;
+}
+
+uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi) {
+    // Option B: plla_per is 7680 fs at 48 or 44.1 kHz, and the SMI takes 768 fs.
+    uint32_t base = freq == 0 ? 0 : freq % 11025u == 0 ? 44100u : freq % 8000u == 0 ? 48000u : 0;
+    if (base == 0 || (10u * base) % freq) {
+        return PLL_ROW_COUNT;
+    }
+    uint32_t d = 10u * base / freq;
+    if (d < 1u || d > 15u) {
+        return PLL_ROW_COUNT;   // CM_SMI has 4 integer bits
+    }
+    *divi = d;
+    return base == 48000u ? PLL_ROW_B48 : PLL_ROW_B44;
+}
+
+void pll_out_set_in_use(bool on) {
+    in_use = on;
 }
 
 void pll_out_request(uint32_t row) {
@@ -231,8 +281,12 @@ void pll_out_poll(void) {
     uint32_t row = pending_row;
     if (row != 0xFFFFFFFFu && st.state != PLL_WAITING) {
         pending_row = 0xFFFFFFFFu;
+        if (in_use && needs_hold(row)) {
+            st.refused++;   // holding the channel would stop the SMI
+            return;
+        }
         retune(row);
-        lock_wait_step(true);
+        lock_wait_step(per_held);
     } else if (st.state == PLL_WAITING) {
         lock_wait_step(false);
     } else if (st.state == PLL_LOCKED && !(REG(CM_LOCK) & FLOCKA)) {
@@ -259,5 +313,8 @@ void pll_out_status(pll_out_status_t *out) {
     st.v3d_div = rd(CM_V3DDIV);
     st.pcm_ctl = rd(CM_PCMCTL);
     st.pcm_div = rd(CM_PCMDIV);
+    st.smi_ctl = rd(CM_SMICTL);
+    st.smi_div = rd(CM_SMIDIV);
+    st.in_use = in_use;
     *out = st;
 }

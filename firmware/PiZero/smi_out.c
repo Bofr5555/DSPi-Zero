@@ -7,6 +7,7 @@
 #include "irq.h"
 #include "broadcom/caches.h"
 #include "mbox.h"
+#include "pll_out.h"
 
 #define REG(a) (*(volatile uint32_t *)(a))
 
@@ -31,6 +32,7 @@
 #define CM_SMIDIV 0x3F1010B4u
 #define CM_PASSWD (0x5Au << 24)
 #define CM_SRC_PLLD 6u
+#define CM_SRC_PLLA 4u
 #define CM_ENAB (1u << 4)
 #define CM_KILL (1u << 5)
 #define CM_BUSY (1u << 7)
@@ -68,6 +70,7 @@ static uint32_t last_off_words;     // DMA offset in the ring at the last read, 
 static uint32_t word_rem;           // words read past the last whole frame
 static uint32_t last_us;
 static uint32_t l_refresh_at;
+static uint32_t source = SMI_SRC_PLLD;     // the preferred source; PLLD is the fallback
 
 static uint32_t micros(void) {
     return REG(0x3F003004u);
@@ -90,24 +93,41 @@ static uint32_t pick_channel(void) {
     return 4;
 }
 
-// 256 fs words of CYCLE_CLOCKS clocks each. The fraction is dithered by MASH 1, so the average is exact
-// to the divider's 1/256 step (about 70 ppm at worst here).
+// 256 fs words of CYCLE_CLOCKS clocks each. From PLLA the divider is an integer (PiZero_PLLA_plan.md).
+// From PLLD the fraction is dithered by MASH 1, so the average is exact to the 1/256 step (about 70 ppm
+// at worst here). A move between PLLA rows is live, so the clock never waits for a lock here.
 static void clock_set(uint32_t freq) {
-    uint64_t want = (uint64_t)freq * SMI_FRAME_WORDS * CYCLE_CLOCKS;
-    uint32_t div = (uint32_t)((((uint64_t)500000000u << 8) + want / 2u) / want);
-    REG(CM_SMICTL) = CM_PASSWD | CM_KILL;
+    uint32_t divi = 0;
+    uint32_t row = source == SMI_SRC_PLLA ? pll_out_smi_row(freq, &divi) : PLL_ROW_COUNT;
+    bool plla = row < PLL_ROW_COUNT && pll_out_select(row);
+    uint32_t div = divi << 8, ctl = CM_SRC_PLLA;
+    if (!plla) {
+        uint64_t want = (uint64_t)freq * SMI_FRAME_WORDS * CYCLE_CLOCKS;
+        div = (uint32_t)((((uint64_t)500000000u << 8) + want / 2u) / want);
+        ctl = CM_SRC_PLLD | CM_MASH1;
+    }
+    // Stop the clock at the end of its cycle before changing it, and kill it only if it will not stop.
+    // CM_SMI's MASH bit reads back set whatever is written; with DIVF 0 it never dithers.
+    REG(CM_SMICTL) = CM_PASSWD | (REG(CM_SMICTL) & 0x60Fu);
     uint32_t t0 = micros();
     while ((REG(CM_SMICTL) & CM_BUSY) && micros() - t0 < 1000u) {
     }
+    if (REG(CM_SMICTL) & CM_BUSY) {
+        REG(CM_SMICTL) = CM_PASSWD | CM_KILL;
+        while ((REG(CM_SMICTL) & CM_BUSY) && micros() - t0 < 2000u) {
+        }
+    }
     REG(CM_SMIDIV) = CM_PASSWD | ((div >> 8) & 15u) << 12 | (div & 255u) << 4;     // DIVI 15:12, DIVF 11:4
-    REG(CM_SMICTL) = CM_PASSWD | CM_SRC_PLLD | CM_MASH1;
-    REG(CM_SMICTL) = CM_PASSWD | CM_SRC_PLLD | CM_MASH1 | CM_ENAB;
+    REG(CM_SMICTL) = CM_PASSWD | ctl;
+    REG(CM_SMICTL) = CM_PASSWD | ctl | CM_ENAB;
+    pll_out_set_in_use(plla);
     st.div_q8 = div;
     st.freq = freq;
 }
 
-// Brings st.frames up to the DMA position. Interrupts must be masked.
-static void track(void) {
+// Brings st.frames up to the DMA position. Interrupts must be masked. Whole rings are inferred from the
+// elapsed time, except right after a clock change, when the time since the last read says nothing.
+static void track_words(bool infer_rings) {
     uint32_t now = micros();
     uint32_t off = (REG(DMA_SOURCE(st.dma_channel)) - ring_bus) / 2u;
     if (off > ring_bytes / 2u) {
@@ -117,7 +137,7 @@ static void track(void) {
     uint32_t d = (off - last_off_words) & (n - 1u);
     // Add whole rings so the advance is the one nearest what the elapsed time predicts.
     uint32_t expect = (uint32_t)((uint64_t)(now - last_us) * st.freq * SMI_FRAME_WORDS / 1000000u);
-    if (expect > d + n / 2u) {
+    if (infer_rings && expect > d + n / 2u) {
         d += ((expect - d + n / 2u) / n) * n;
     }
     last_off_words = off;
@@ -125,6 +145,10 @@ static void track(void) {
     uint32_t total = word_rem + d;
     st.frames += total / SMI_FRAME_WORDS;
     word_rem = total % SMI_FRAME_WORDS;
+}
+
+static void track(void) {
+    track_words(true);
 }
 
 // Composes up to LEAD_FRAMES past the DMA, and keeps the SMI's length target out of reach: the transfer
@@ -248,7 +272,23 @@ void smi_out_set_rate(uint32_t freq) {
         track();
     }
     clock_set(freq);
+    if (st.running) {
+        track_words(false);
+    }
     irq_global_restore(save);
+}
+
+void smi_out_set_source(uint32_t src) {
+    uint32_t divi, row = pll_out_smi_row(st.freq, &divi);
+    if (src == SMI_SRC_PLLA && row < PLL_ROW_COUNT) {
+        pll_out_select(row);    // a first start waits for lock, so it is done with interrupts on
+    }
+    source = src;
+    smi_out_set_rate(st.freq);
+}
+
+uint32_t smi_out_source(void) {
+    return (REG(CM_SMICTL) & 15u) == CM_SRC_PLLA ? SMI_SRC_PLLA : SMI_SRC_PLLD;
 }
 
 uint32_t smi_out_frames(void) {

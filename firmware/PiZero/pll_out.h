@@ -32,7 +32,15 @@ typedef struct {
     // Live registers, then the firmware's values as found at the first retune.
     uint32_t ctrl, frac, ana1, per, core, cm_plla, cm_lock, v3d_ctl, v3d_div, pcm_ctl, pcm_div;
     uint32_t fw_ctrl, fw_frac, fw_per, fw_cm_plla;
+    uint32_t smi_ctl, smi_div, in_use, refused;     // phase 2: the SMI clock and who owns PLLA
 } pll_out_status_t;
+
+// For the SMI: selects a row now and returns true once plla_per runs at it. A move within the same PER
+// divider is live and returns at once; a first start waits for lock and must not be done with the
+// SMI on PLLA. pll_out_smi_row() picks the row and CM_SMI divider for a rate, or returns PLL_ROW_COUNT.
+bool pll_out_select(uint32_t row);
+uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi);
+void pll_out_set_in_use(bool on);                   // the SMI runs from plla_per: bench moves that hold it are refused
 
 void pll_out_request(uint32_t row);                 // carried out by pll_out_poll()
 void pll_out_count_request(uint32_t mux, uint32_t osc_cycles);

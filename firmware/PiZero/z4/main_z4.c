@@ -556,6 +556,8 @@ static void sensors_refresh(void) {
     sensor_temp_cc = (int32_t)(mbox_temperature_mc() + 5u) / 10;
 }
 
+static volatile uint32_t smi_source_request = 0xFFFFFFFFu;     // bench 0x46 op 4, run from the main loop
+
 bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req) {
     static u2_reply_t reply;
     bool in = req->bmRequestType_bit.direction == TUSB_DIR_IN;
@@ -592,7 +594,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
     }
     // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
-    // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles. IN returns the status.
+    // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles, 4 puts the SMI on PLLA
+    // (wIndex 1) or PLLD (0). IN returns the status.
     if (bench && req->bRequest == 0x46) {
         static pll_out_status_t pst;
         if (stage != CONTROL_STAGE_SETUP) {
@@ -609,6 +612,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         } else if (req->wValue == 3) {
             uint32_t gates = req->wIndex >> 8;
             pll_out_count_request(req->wIndex & 0xFFu, (gates ? gates : 1u) * 192000u);
+        } else if (req->wValue == 4) {
+            smi_source_request = req->wIndex;
         } else {
             return false;
         }
@@ -1041,6 +1046,10 @@ int main(void) {
     for (;;) {
         sensors_refresh();
         pll_out_poll();
+        if (smi_source_request != 0xFFFFFFFFu) {
+            smi_out_set_source(smi_source_request);
+            smi_source_request = 0xFFFFFFFFu;
+        }
         z4_service_producer();
         z4_dspi_service();
         uart_poll();

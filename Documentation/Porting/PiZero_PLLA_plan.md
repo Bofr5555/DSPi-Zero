@@ -344,3 +344,25 @@ This also proves there is no hidden divider on `plla_per`, and that odd PER divi
 **Not done.** HDMI hot-plug and thermal throttling are still not captured. The phase 6 watchdog covers them.
 
 **Verdict.** Phase 1 passes for both options. Phase 2 moves the SMI onto `plla_per` with row b48.
+
+## 10. Phase 2 results (2026-11-12)
+
+Code:
+- **`smi_out.c` `clock_set()`** takes PLLA when it is the preferred source and the rate allows it. `pll_out_smi_row()` picks row b48 or b44 and an integer CM_SMI divider (10 fs base / rate, 1 to 15). Any other rate, or a PLLA that fails to lock, falls back to PLLD with MASH.
+- **Live moves:** a move between rows with the same PER divider happens live. The PLL slews while the SMI keeps running, so a rate change never waits for lock with interrupts off. Only the first start holds the PER channel and waits for lock, and `smi_out_set_source()` does that with interrupts on while the SMI is still on PLLD.
+- **Bench guard:** once the SMI runs from `plla_per`, bench retunes that would hold the channel are refused.
+- **`track()`:** after a clock change it counts the words the DMA has read but does not infer whole rings from the elapsed time.
+- **Clock changes** stop CM_SMI at the end of a cycle (ENAB cleared, BUSY gone within 1 µs) instead of killing it. KILL remains only as a fallback.
+- **Bench request** `0x46` op 4 selects the source, checked with `tools/smi_pll_check.py`. PLLD stays the boot default until phase 6.
+
+**Exact clock.** The counter reads the SMI clock at 36.864000 MHz (0.000 ppm) at 48 kHz, 73.728000 MHz (0.000 ppm) at 96 kHz, and 33.868803 MHz (+0.074 ppm, one count, from FRAC rounding) at 44.1 kHz. On PLLD the same counter reads 36.866360 MHz, which is +64.0 ppm.
+
+**CM_SMI's MASH bit.** CTL reads 0x294 on PLLA, with bit 9 set, whatever is written. The clock was confirmed stopped and not BUSY when CTL was written. The PCM clock clears the same bit normally, so on CM_SMI the bit appears fixed. With DIVF 0, a first-order MASH accumulator never carries, so the output is a pure integer division.
+
+**Toggles.** 20 switches between PLLA and PLLD while streaming at 48 kHz. The SMI frame count stayed within 4 frames of what the two clock rates predict (a ring is 128 frames, and timestamp rounding is 48). Composer lateness, slot underruns, ring drops and USB underruns did not move.
+
+**Soak.** 10 minutes on PLLA at 48 kHz with I2S and S/PDIF slots: no underruns, ring drops or late compositions, and every slot decodes. The feedback controller's long-window rate reads +1.9 to +2.5 ppm, against +65 ppm on PLLD. That residual is the Pi crystal against the host's USB frame clock, as predicted in section 1.3.
+
+**Rates.** 44.1, 96 and 48 kHz each decode with zero parity or clock errors after a rate change from the host. The 44.1 kHz switch moves PLLA live from b48 to b44 and back.
+
+**Verdict.** Phase 2 passes. Phase 3 (switch timing and a 50-switch loop) is next.

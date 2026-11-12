@@ -32,6 +32,12 @@ typedef struct {
 // after each compose) on the GPIOs in pin_mask (SD0-SD15 are GPIO 8-23). Runs until stopped, composing as it goes.
 bool smi_out_start(uint16_t *ring, uint32_t ring_frames, uint32_t freq, uint32_t pin_mask, smi_compose_fn compose);
 void smi_out_set_rate(uint32_t freq);
+
+// Clock source. PLLA gives an integer divider (PiZero_PLLA_plan.md) at rates it covers; any other rate,
+// or a PLLA that does not lock, falls back to PLLD with MASH. smi_out_source() reports the one in use.
+enum { SMI_SRC_PLLD, SMI_SRC_PLLA };
+void smi_out_set_source(uint32_t src);
+uint32_t smi_out_source(void);
 uint32_t smi_out_frames(void);      // frames the DMA has read; safe from any context
 uint32_t smi_out_composed(void);    // frames composed so far, the reader position of the slot rings
 uint32_t smi_out_words2(void);      // frames the DMA has read, times 2, to 1/128 frame: I2S ring words
