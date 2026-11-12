@@ -122,6 +122,17 @@ uint32_t mbox_board_revision(void) {
     return v ? v[0] : 0;
 }
 
+uint32_t mbox_clock_rate_max(uint32_t clock_id) {
+    volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_GET_MAX_CLOCK_RATE, 8, clock_id, 0);
+    return v ? v[1] : 0;
+}
+
+uint32_t mbox_set_clock_rate(uint32_t clock_id, uint32_t hz) {
+    // Value words: clock id, rate, skip-turbo (0, so the firmware also enters turbo for the ARM).
+    volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_SET_CLOCK_RATE, 12, clock_id, hz);
+    return v ? v[1] : 0;
+}
+
 uint32_t mbox_voltage_uv(uint32_t voltage_id) {
     volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_GET_VOLTAGE, 8, voltage_id, 0);
     return v ? v[1] : 0;

@@ -784,6 +784,14 @@ int main(void) {
 #if BCM_VERSION == 2837
     mmu_enable();   // D-cache on: DSP data no longer comes from SDRAM on every access
 #endif
+    // The VideoCore keeps the ARM at arm_freq_min (600 MHz on a Zero 2 W) until the OS asks for more,
+    // as Linux's cpufreq does. Ask for the maximum; the firmware still throttles if it gets too hot.
+    {
+        uint32_t max_hz = mbox_clock_rate_max(VCMAILBOX_CLOCK_ARM);
+        if (max_hz) {
+            mbox_set_clock_rate(VCMAILBOX_CLOCK_ARM, max_hz);
+        }
+    }
     board_led_init();
     uart_init(BOARD_UART_CLOCK_HZ, BOARD_UART_BAUD);
     uart_puts("\nDSPi PiZero Z4 pipeline (" __DATE__ " " __TIME__ ")\n");

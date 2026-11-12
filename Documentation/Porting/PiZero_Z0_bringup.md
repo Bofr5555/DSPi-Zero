@@ -464,6 +464,8 @@ The 40 underruns outside the windows come at stream edges, as the FIFO drains af
 - **Board byte.** A `GET_PLATFORM` request for 8 or more bytes gets DSPi's 7 bytes plus byte 7 = `1`, which means Raspberry Pi Zero 2 W. Byte 0 stays RP2350, the code base every Console feature gate uses. A 7-byte request still goes to DSPi unchanged. DSPi Console (`StatsView.swift`) asks for 8 bytes and shows the board name in Device Information. Its `platformName` gating is unchanged.
 - **Sensor readings.** `GET_STATUS` 13, 14 and 16 return the VideoCore's measured ARM clock, core voltage (tag `0x00030003`, id 1) and SoC temperature (tag `0x00030006`). The main loop caches them once a second, because a mailbox round trip is too slow for a control request. Measured values were 1000000000 Hz, 1256 mV and 36.48 °C.
 
+**ARM clock.** The VideoCore keeps the ARM at `arm_freq_min` (600 MHz on the Zero 2 W) until the OS asks for more, as Linux's cpufreq driver does. The 1000 MHz read just after boot dropped to 600 MHz once the firmware's boot period ended. Z4 now asks for the maximum at boot, using GET_MAX_CLOCK_RATE `0x00030004` then SET_CLOCK_RATE `0x00038002` with skip-turbo 0. The clock then held 1000 MHz over a minute of checks. The firmware still throttles on temperature. The earlier block timings were taken soon after boot, at 1000 MHz, so they stand.
+
 **DSPi Console** found the board on its own and polled it at about 36 requests a second with none stalled.
 
 **DSPi's control-plane harness** (`python3.14 -m tools.dspi_test.run`, no flash tests) passed 110 of 138 tests, with 12 failures, 0 errors and 16 skipped, over 2805 GETs and 1249 SETs. That run had the D-cache off, and the harness restored the state byte for byte. The failures broke down as follows:
