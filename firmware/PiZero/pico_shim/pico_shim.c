@@ -29,6 +29,7 @@
 
 #include "board.h"
 #include "mbox.h"
+#include "smi_out.h"
 #include "uart.h"
 
 // After the Pi's uart.h: this one renames the SDK's uart_init.
@@ -728,47 +729,67 @@ void gpio_acknowledge_irq(uint gpio, uint32_t event_mask) {
 // ---------------------------------------------------------------------------------------------------
 // Output slot rings, drained by the system timer
 
+// Output clock: frames taken from the slot rings since boot. Once the SMI runs it is the composer's frame
+// count: the composer is what reads the rings, so DSPi's fill and underrun accounting see the real reader,
+// and every ring and the USB consumer follow the output hardware. Before that it runs from the system
+// timer. Every output runs at one rate, as on the RP2350.
+static uint32_t oc_frames, oc_last_us, oc_frac, oc_freq = 48000;
+static bool oc_smi;
+
+static void spdif_set_status_rate(uint32_t freq);
+
+uint32_t shim_output_clock(void) {
+    if (oc_smi) {
+        return smi_out_composed();
+    }
+    uint32_t save = save_and_disable_interrupts();
+    uint32_t now = time_us_32();
+    {
+        uint64_t acc = (uint64_t)(now - oc_last_us) * oc_freq + oc_frac;
+        uint32_t frames = (uint32_t)(acc / 1000000u);
+        oc_frac = (uint32_t)(acc - (uint64_t)frames * 1000000u);
+        oc_frames += frames;
+    }
+    oc_last_us = now;
+    restore_interrupts(save);
+    return oc_frames;
+}
+
+static void shim_output_clock_set_rate(uint32_t freq) {
+    shim_output_clock();    // frames so far count at the old rate
+    oc_freq = freq;
+    spdif_set_status_rate(freq);
+    if (oc_smi) {
+        smi_out_set_rate(freq);
+    }
+}
+
 // Accounting as in pico_audio_spdif_multi and pico_audio_i2s_multi, field for field, so DSPi's
 // admission, recovery and fill logic runs as on the RP2350. Only the reader differs: an enabled ring
-// consumes freq frames per second of system timer time from the moment it was enabled.
-// last_read_addr holds the fractional remainder, in frame-microseconds.
+// consumes what the output clock counts from the moment it was enabled. last_read_time_us holds the
+// output clock at the last read.
 
-// Frames are stored raw (L and R words at the start of each frame slot) and silence as zeros, so the
-// memory traffic is there but nothing is encoded. consumed_words is frames times the real words per frame.
+// The ring contents match the RP2350 libraries': S/PDIF frames as NRZI-coded cells, I2S frames as
+// left-justified 32-bit L and R words. consumed_words is frames times the real words per frame.
 #define SHIM_RING_FUNCS(P, T, RING_FRAMES_, ERASE_AHEAD_, WORDS_PER_FRAME_)                              \
     static void P##_shim_stamp_silence(T *inst, uint32_t e, uint32_t n) {                                 \
-        uint32_t *ring = (uint32_t *)inst->ring;                                                          \
-        while (n--) {                                                                                     \
-            uint32_t *f = &ring[(e++ & ((RING_FRAMES_) - 1u)) * (WORDS_PER_FRAME_)];                      \
-            f[0] = 0;                                                                                     \
-            f[1] = 0;                                                                                     \
-        }                                                                                                 \
+        P##_stamp_silence_run((uint32_t *)inst->ring, e, n);                                              \
     }                                                                                                     \
                                                                                                           \
-    /* Brings consumed_frames up to now. Interrupts must be masked. */                                    \
+    /* Brings consumed_frames up to the output clock. Interrupts must be masked. */                      \
     static void P##_shim_advance(T *inst) {                                                               \
-        uint32_t now = time_us_32();                                                                      \
-        uint32_t elapsed = now - inst->last_read_time_us;                                                 \
-        inst->last_read_time_us = now;                                                                    \
+        uint32_t clk = shim_output_clock();                                                               \
+        uint32_t frames = clk - inst->last_read_time_us;                                                  \
+        inst->last_read_time_us = clk;                                                                    \
         if (!inst->enabled || inst->freq == 0) {                                                          \
             return;                                                                                       \
-        }                                                                                                 \
-        uint32_t frames;                                                                                  \
-        if (elapsed < 40000u) { /* 40 ms * 96 kHz + 1e6 fits in 32 bits */                                \
-            uint32_t acc = elapsed * inst->freq + inst->last_read_addr;                                   \
-            frames = acc / 1000000u;                                                                      \
-            inst->last_read_addr = acc - frames * 1000000u;                                               \
-        } else {                                                                                          \
-            uint64_t acc = (uint64_t)elapsed * inst->freq + inst->last_read_addr;                         \
-            frames = (uint32_t)(acc / 1000000u);                                                          \
-            inst->last_read_addr = (uint32_t)(acc - (uint64_t)frames * 1000000u);                         \
         }                                                                                                 \
         inst->consumed_frames += frames;                                                                  \
         inst->consumed_words += frames * (WORDS_PER_FRAME_);                                              \
     }                                                                                                     \
                                                                                                           \
     static void P##_shim_start(T *inst) {                                                                 \
-        inst->last_read_time_us = time_us_32();                                                           \
+        inst->last_read_time_us = shim_output_clock();                                                    \
         inst->last_read_addr = 0;                                                                         \
         inst->enabled = true;                                                                             \
     }                                                                                                     \
@@ -806,7 +827,7 @@ void gpio_acknowledge_irq(uint gpio, uint32_t event_mask) {
         inst->consumed_frames = 0;                                                                        \
         inst->consumed_word_rem = 0;                                                                      \
         inst->last_read_addr = 0;                                                                         \
-        inst->last_read_time_us = time_us_32();                                                           \
+        inst->last_read_time_us = shim_output_clock();                                                    \
         inst->snap_produced_frames = 0;                                                                   \
         inst->snap_consumed_frames = 0;                                                                   \
         inst->recovery_prewrite_fill_frames = UINT32_MAX;                                                 \
@@ -858,12 +879,7 @@ void gpio_acknowledge_irq(uint gpio, uint32_t event_mask) {
             return;                                                                                       \
         }                                                                                                 \
         uint32_t w = inst->wr_frames;                                                                     \
-        uint32_t *ring = (uint32_t *)inst->ring;                                                          \
-        for (uint32_t i = 0; i < frames; i++) {                                                           \
-            uint32_t *f = &ring[((w + i) & ((RING_FRAMES_) - 1u)) * (WORDS_PER_FRAME_)];                  \
-            f[0] = (uint32_t)lr[2u * i];                                                                  \
-            f[1] = (uint32_t)lr[2u * i + 1u];                                                             \
-        }                                                                                                 \
+        P##_stamp_audio_run((uint32_t *)inst->ring, w, lr, frames);                                       \
         w += frames;                                                                                      \
         inst->wr_frames = w;                                                                              \
         uint32_t e = inst->erased_frames;                                                                 \
@@ -880,6 +896,107 @@ void gpio_acknowledge_irq(uint gpio, uint32_t event_mask) {
         inst->snap_produced_frames = w;                                                                   \
         inst->snap_consumed_frames = consumed;                                                            \
     }
+
+// S/PDIF encoding, as pico_audio_spdif_multi's software encoder (pico-extras audio_spdif.c and
+// sample_encoding.h, BSD-3-Clause, Raspberry Pi Ltd): each subframe is 64 NRZI cells, LSB first, where a
+// 1 toggles the line. The channel-status bit comes from the absolute frame index modulo 192.
+#define PREAMBLE_X 0b11001001u
+#define PREAMBLE_Y 0b01101001u
+#define PREAMBLE_Z 0b00111001u
+
+static uint32_t spdif_lookup[256];
+static uint8_t spdif_channel_status[5] = {0x04, 0x00, 0x00, 0x02, 0x0B};   // byte 3: sample rate
+
+static void spdif_lookup_init(void) {
+    for (uint32_t i = 0; i < 256u; i++) {
+        uint32_t v = 0x5555u, p = 0;
+        for (uint32_t j = 0; j < 8u; j++) {
+            if (i & (1u << j)) {
+                p ^= 1u;
+                v |= 2u << (j * 2u);
+            }
+        }
+        spdif_lookup[i] = v | (p << 16u);
+    }
+}
+
+static void spdif_set_status_rate(uint32_t freq) {  // channel status byte 3
+    switch (freq) {
+        case 44100: spdif_channel_status[3] = 0x00; break;
+        case 48000: spdif_channel_status[3] = 0x02; break;
+        case 96000: spdif_channel_status[3] = 0x0A; break;
+        default: spdif_channel_status[3] = 0x01; break;
+    }
+}
+
+static inline uint32_t spdif_cs_bit(uint32_t phase) {
+    return phase < 40u ? (spdif_channel_status[phase / 8u] >> (phase % 8u)) & 1u : 0u;
+}
+
+static inline void spdif_update_subframe(uint32_t *sf, int32_t sample) {
+    uint32_t s0 = spdif_lookup[(uint8_t)sample];
+    uint32_t s1 = spdif_lookup[(uint8_t)(sample >> 8u)];
+    uint32_t s2 = spdif_lookup[(uint8_t)(sample >> 16u)];
+    sf[0] = (sf[0] & 0xFFu) | ((uint32_t)(uint16_t)s0 << 8u) | (s1 << 24u);
+    uint32_t ph = sf[1] >> 24u;
+    uint32_t h = ((uint32_t)(uint16_t)s1 >> 8u) | ((uint32_t)(uint16_t)s2 << 8u);
+    uint32_t p = (s0 >> 16u) ^ (s1 >> 16u) ^ (s2 >> 16u);
+    p ^= (((ph & 0x2Au) * 0x2Au) >> 6u) & 1u;
+    sf[1] = h | ((ph & 0x7Fu) << 24u) | (p << 31u);
+}
+
+static void audio_spdif_stamp_audio_run(uint32_t *ring, uint32_t w, const int32_t *lr, uint32_t n) {
+    uint32_t phase = w % PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t *f = &ring[((w + i) & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u)) * 4u];
+        uint32_t c = spdif_cs_bit(phase);
+        f[0] = phase == 0 ? PREAMBLE_Z : PREAMBLE_X;
+        f[1] = 0x55000000u | (c << 29u);
+        spdif_update_subframe(&f[0], lr[2u * i]);
+        f[2] = PREAMBLE_Y;
+        f[3] = 0x55000000u | (c << 29u);
+        spdif_update_subframe(&f[2], lr[2u * i + 1u]);
+        if (++phase == PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT) {
+            phase = 0;
+        }
+    }
+}
+
+static void audio_spdif_stamp_silence_run(uint32_t *ring, uint32_t e, uint32_t n) {
+    uint32_t phase = e % PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT;
+    while (n--) {
+        uint32_t *f = &ring[(e++ & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u)) * 4u];
+        uint32_t c = spdif_cs_bit(phase);
+        uint32_t h = 0x55555555u | (c << 29u) | (c << 31u);
+        f[0] = 0x55555500u | (phase == 0 ? PREAMBLE_Z : PREAMBLE_X);
+        f[1] = h;
+        f[2] = 0x55555500u | PREAMBLE_Y;
+        f[3] = h;
+        if (++phase == PICO_AUDIO_SPDIF_BLOCK_SAMPLE_COUNT) {
+            phase = 0;
+        }
+    }
+}
+
+// I2S words as pico_audio_i2s_multi stores them: the 24-bit sample left-justified, with 0x01 in the pad
+// byte so a DAC's zero-detect mute never latches.
+#define I2S_PAD_PATTERN 0x01u
+
+static void audio_i2s_stamp_audio_run(uint32_t *ring, uint32_t w, const int32_t *lr, uint32_t n) {
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t *f = &ring[((w + i) & (PICO_AUDIO_I2S_RING_FRAMES - 1u)) * 2u];
+        f[0] = (uint32_t)lr[2u * i] << 8 | I2S_PAD_PATTERN;
+        f[1] = (uint32_t)lr[2u * i + 1u] << 8 | I2S_PAD_PATTERN;
+    }
+}
+
+static void audio_i2s_stamp_silence_run(uint32_t *ring, uint32_t e, uint32_t n) {
+    while (n--) {
+        uint32_t *f = &ring[(e++ & (PICO_AUDIO_I2S_RING_FRAMES - 1u)) * 2u];
+        f[0] = I2S_PAD_PATTERN;
+        f[1] = I2S_PAD_PATTERN;
+    }
+}
 
 // S/PDIF frames are two subframes of two words; I2S frames are two words.
 SHIM_RING_FUNCS(audio_spdif, audio_spdif_instance_t, PICO_AUDIO_SPDIF_RING_FRAMES, PICO_AUDIO_SPDIF_ERASE_AHEAD, 4u)
@@ -903,6 +1020,7 @@ void audio_spdif_setup(audio_spdif_instance_t *inst, uint32_t sample_freq, const
     inst->dma_reload_channel = config->dma_reload_channel;
     inst->pin = config->pin;
     inst->freq = sample_freq;
+    shim_output_clock_set_rate(sample_freq);
     inst->enabled = false;
     inst->instance_index = config->dma_channel;
     inst->ring = (uint32_t *)config->ring_base;
@@ -987,6 +1105,7 @@ void audio_spdif_apply_pio_frequency(audio_spdif_instance_t *inst, uint32_t samp
     uint32_t save = save_and_disable_interrupts();
     audio_spdif_shim_advance(inst);     // frames so far count at the old rate
     inst->freq = sample_freq;
+    shim_output_clock_set_rate(sample_freq);
     restore_interrupts(save);
 }
 
@@ -1028,6 +1147,7 @@ uint32_t audio_spdif_get_dma_starvations_instance(uint index) {
 static audio_i2s_instance_t *i2s_instances[PICO_AUDIO_I2S_MAX_INSTANCES];
 static uint i2s_instance_count;
 
+
 void audio_i2s_setup(audio_i2s_instance_t *inst, uint32_t sample_freq, const audio_i2s_config_t *config) {
     inst->pio = pio_for_index(config->pio);
     inst->pio_sm = config->pio_sm;
@@ -1038,6 +1158,7 @@ void audio_i2s_setup(audio_i2s_instance_t *inst, uint32_t sample_freq, const aud
     inst->external_clock = config->external_clock;
     inst->clock_master = config->external_clock ? false : config->clock_master;
     inst->freq = sample_freq;
+    shim_output_clock_set_rate(sample_freq);
     inst->enabled = false;
     inst->instance_index = config->dma_channel;
     inst->ring = (int32_t *)config->ring_base;
@@ -1143,6 +1264,7 @@ void audio_i2s_update_all_frequencies(uint32_t sample_freq) {
         audio_i2s_shim_advance(i2s_instances[i]);
         i2s_instances[i]->freq = sample_freq;
     }
+    shim_output_clock_set_rate(sample_freq);
     restore_interrupts(save);
 }
 
@@ -1187,4 +1309,168 @@ void audio_i2s_mck_apply_state(uint pin, bool enabled, uint32_t sample_freq, uin
     (void)sample_freq, (void)multiplier;
     mck_pin = (uint8_t)pin;
     mck_enabled = enabled;
+}
+
+// ---------------------------------------------------------------------------------------------------
+// SMI composer: every slot ring onto one parallel stream, 256 words per frame, so all outputs change on
+// the same SMI cycle. Slot n's data is SD n (GPIO 8 + n); the I2S bit clock is SD4 (GPIO 12) and LRCLK
+// SD5 (GPIO 13). An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every sample rate.
+
+#include <arm_acle.h>
+#include <arm_neon.h>
+
+#define SMI_SLOTS 4u
+#define SMI_BIT_BCK 4u
+#define SMI_BIT_LRCLK 5u
+#define SMI_PIN_MASK (0x3Fu << 8)
+#define SMI_RING_FRAMES 128u
+
+static uint16_t smi_ring[SMI_RING_FRAMES * SMI_FRAME_WORDS] __attribute__((aligned(64)));   // cached; smi_out cleans it
+
+extern uint8_t slot_ring_store[];   // usb_audio.c: one PICO_AUDIO_SPDIF_RING_BYTES ring per slot
+
+static uint8_t lut_cell2[256][16] __attribute__((aligned(16)));    // 8 cells, bit 0 first, to 16 words
+static uint8_t lut_bck4[256][32] __attribute__((aligned(16)));     // 8 I2S bits to 32 words
+static uint8_t i2s_clock_bytes[SMI_FRAME_WORDS] __attribute__((aligned(16)));   // BCK and LRCLK, a byte a word
+
+typedef struct {
+    const uint32_t *ring;
+    uint32_t offset;    // ring frame = SMI frame + offset
+    uint8_t bit;
+    uint8_t i2s;
+} comp_slot_t;
+
+static void smi_tables_init(void) {
+    for (uint32_t v = 0; v < 256u; v++) {
+        for (uint32_t j = 0; j < 8u; j++) {
+            uint8_t b = (uint8_t)((v >> j) & 1u);
+            lut_cell2[v][2u * j] = lut_cell2[v][2u * j + 1u] = b;
+            for (uint32_t k = 0; k < 4u; k++) {
+                lut_bck4[v][4u * j + k] = b;
+            }
+        }
+    }
+    // Philips I2S: BCK low then high within each bit (data changes on the falling edge), LRCLK low for
+    // the left half. Data runs one bit clock behind LRCLK, which the composer builds into the bit stream.
+    for (uint32_t w = 0; w < SMI_FRAME_WORDS; w++) {
+        uint32_t k = w / 4u;
+        i2s_clock_bytes[w] = (uint8_t)(((w % 4u) >= 2u) << SMI_BIT_BCK | (k >= 32u) << SMI_BIT_LRCLK);
+    }
+}
+
+// NRZI cells (1 = toggle) to line levels: a running XOR. Every subframe has an even number of
+// transitions, so each frame starts from the same level and needs no state from the last one.
+static inline uint32_t nrzi_levels(uint32_t x, uint32_t *carry) {
+    x ^= x << 1;
+    x ^= x << 2;
+    x ^= x << 4;
+    x ^= x << 8;
+    x ^= x << 16;
+    if (*carry) {
+        x = ~x;
+    }
+    *carry = x >> 31;
+    return x;
+}
+
+static uint32_t smi_gather(comp_slot_t *slots, bool *any_i2s) {
+    uint32_t n = 0;
+    *any_i2s = false;
+    for (uint i = 0; i < spdif_instance_count; i++) {
+        audio_spdif_instance_t *inst = spdif_instances[i];
+        uint32_t slot = (uint32_t)((uint8_t *)inst->ring - slot_ring_store) / PICO_AUDIO_SPDIF_RING_BYTES;
+        if (inst->enabled && inst->ring && slot < SMI_SLOTS) {
+            slots[n++] = (comp_slot_t){(const uint32_t *)inst->ring, inst->consumed_frames - inst->last_read_time_us,
+                                       (uint8_t)slot, 0};
+        }
+    }
+    for (uint i = 0; i < i2s_instance_count; i++) {
+        audio_i2s_instance_t *inst = i2s_instances[i];
+        uint32_t slot = (uint32_t)((uint8_t *)inst->ring - slot_ring_store) / PICO_AUDIO_SPDIF_RING_BYTES;
+        if (inst->enabled && inst->ring && slot < SMI_SLOTS) {
+            slots[n++] = (comp_slot_t){(const uint32_t *)inst->ring, inst->consumed_frames - inst->last_read_time_us,
+                                       (uint8_t)slot, 1};
+            *any_i2s = true;
+        }
+    }
+    return n;
+}
+
+static const uint8_t zero_row[32] __attribute__((aligned(16)));
+
+// Builds each frame 16 words at a time. Slot n is always bit n, so the four slots merge with shift-and-
+// insert (a disabled slot reads a row of zeros), then the clocks are ORed in and the block is widened.
+static void smi_compose(uint32_t frame, uint16_t *dst, uint32_t n) {
+    comp_slot_t found[2u * SMI_SLOTS];
+    bool any_i2s;
+    uint32_t nf = smi_gather(found, &any_i2s);
+    const comp_slot_t *by_slot[SMI_SLOTS] = {NULL, NULL, NULL, NULL};
+    for (uint32_t s = 0; s < nf; s++) {
+        by_slot[found[s].bit] = &found[s];
+    }
+    for (uint32_t k = 0; k < n; k++, frame++, dst += SMI_FRAME_WORDS) {
+        const uint8_t *rows[SMI_SLOTS][16];   // per slot, the 16-byte table row for each block
+        for (uint32_t s = 0; s < SMI_SLOTS; s++) {
+            const comp_slot_t *c = by_slot[s];
+            if (!c) {
+                for (uint32_t q = 0; q < 16u; q++) {
+                    rows[s][q] = zero_row;
+                }
+            } else if (c->i2s) {
+                uint32_t rf = (frame + c->offset) & (PICO_AUDIO_I2S_RING_FRAMES - 1u);
+                uint32_t prev = (rf - 1u) & (PICO_AUDIO_I2S_RING_FRAMES - 1u);
+                // Bit clock 0 carries the last frame's right LSB, 1-32 the left word MSB first, 33-63 the
+                // right word's top 31 bits.
+                uint32_t lo = (c->ring[prev * 2u + 1u] & 1u) | __rbit(c->ring[rf * 2u]) << 1;
+                uint32_t hi = __rbit(c->ring[rf * 2u]) >> 31 | __rbit(c->ring[rf * 2u + 1u]) << 1;
+                for (uint32_t q = 0; q < 8u; q++) {
+                    rows[s][q] = &lut_bck4[(lo >> (4u * (q & ~1u))) & 0xFFu][16u * (q & 1u)];
+                    rows[s][q + 8u] = &lut_bck4[(hi >> (4u * (q & ~1u))) & 0xFFu][16u * (q & 1u)];
+                }
+            } else {
+                uint32_t rf = (frame + c->offset) & (PICO_AUDIO_SPDIF_RING_FRAMES - 1u);
+                const uint32_t *w = &c->ring[rf * 4u];
+                uint32_t carry = 0;
+                for (uint32_t j = 0; j < 4u; j++) {
+                    uint32_t lv = nrzi_levels(w[j], &carry);
+                    rows[s][4u * j] = lut_cell2[lv & 0xFFu];
+                    rows[s][4u * j + 1u] = lut_cell2[(lv >> 8) & 0xFFu];
+                    rows[s][4u * j + 2u] = lut_cell2[(lv >> 16) & 0xFFu];
+                    rows[s][4u * j + 3u] = lut_cell2[lv >> 24];
+                }
+            }
+        }
+        for (uint32_t q = 0; q < 16u; q++) {
+            uint8x16_t acc = vld1q_u8(rows[0][q]);
+            acc = vsliq_n_u8(acc, vld1q_u8(rows[1][q]), 1);
+            acc = vsliq_n_u8(acc, vld1q_u8(rows[2][q]), 2);
+            acc = vsliq_n_u8(acc, vld1q_u8(rows[3][q]), 3);
+            if (any_i2s) {
+                acc = vorrq_u8(acc, vld1q_u8(&i2s_clock_bytes[16u * q]));
+            }
+            vst1q_u16(&dst[16u * q], vmovl_u8(vget_low_u8(acc)));
+            vst1q_u16(&dst[16u * q + 8u], vmovl_u8(vget_high_u8(acc)));
+        }
+    }
+}
+
+// Starts the SMI stream (before DSPi creates its slots), and from then on the output clock is its frame count.
+void shim_smi_start(void) {
+    spdif_lookup_init();
+    smi_tables_init();
+    if (smi_out_start(smi_ring, SMI_RING_FRAMES, oc_freq, SMI_PIN_MASK, smi_compose)) {
+        oc_smi = true;
+    }
+}
+
+// Bench: copies n frames that are composed but not yet sent, and returns the first one's frame number.
+uint32_t shim_smi_snapshot(uint16_t *out, uint32_t n) {
+    uint32_t save = save_and_disable_interrupts();
+    uint32_t first = smi_out_frames() + 4u;     // composed (the composer is ahead) and not yet sent
+    for (uint32_t k = 0; k < n; k++) {
+        const uint16_t *src = &smi_ring[((first + k) & (SMI_RING_FRAMES - 1u)) * SMI_FRAME_WORDS];
+        memcpy(&out[k * SMI_FRAME_WORDS], src, SMI_FRAME_WORDS * 2u);
+    }
+    restore_interrupts(save);
+    return first;
 }

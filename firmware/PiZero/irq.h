@@ -15,4 +15,5 @@ void irq_global_enable(void);       // CPSR.I clear
 uint32_t irq_global_disable(void);  // returns the previous CPSR for irq_global_restore
 void irq_global_restore(uint32_t cpsr);
 uint32_t irq_count(void);           // IRQs taken, for bench checks
+uint32_t irq_cycles(void);          // CPU cycles in IRQ handlers, wrapping (Cortex-A53 cycle counter)
 uint32_t irq_spurious(void);        // IRQs with no registered handler pending

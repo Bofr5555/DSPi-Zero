@@ -83,10 +83,14 @@ static uint32_t ttb[4096] __attribute__((aligned(16384)));
 #define PERIPH_BASE 0x3F000000u
 #define LOCAL_END   0x40100000u
 
+extern uint8_t __nocache_start[], __nocache_end[];  // pizero_sections.ld, 1 MB aligned
+
 void mmu_enable(void) {
     for (uint32_t i = 0; i < 4096u; i++) {
         uint32_t base = i << 20;
-        if (base < PERIPH_BASE) {
+        if (base >= (uint32_t)__nocache_start && base < (uint32_t)__nocache_end) {
+            ttb[i] = base | SECT | SECT_AP_RW | SECT_TEX1 | SECT_XN;    // Normal, non-cacheable
+        } else if (base < PERIPH_BASE) {
             ttb[i] = base | SECT | SECT_AP_RW | SECT_TEX1 | SECT_C | SECT_B;
         } else if (base < LOCAL_END) {
             ttb[i] = base | SECT | SECT_AP_RW | SECT_B | SECT_XN;

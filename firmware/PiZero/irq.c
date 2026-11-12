@@ -57,7 +57,24 @@ uint32_t irq_spurious(void) {
     return spurious;
 }
 
+static volatile uint32_t cycles_in;
+
+uint32_t irq_cycles(void) {
+    return cycles_in;
+}
+
+static inline uint32_t cycle_count(void) {
+#if __ARM_ARCH >= 7
+    uint32_t v;
+    __asm__ volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(v));   // PMCCNTR, if the image enabled it
+    return v;
+#else
+    return 0;
+#endif
+}
+
 void irq_handler(void) {
+    uint32_t c0 = cycle_count();
     taken++;
     bool handled = false;
     uint32_t p1 = LIC->PENDING_1 & LIC->ENABLE_1;
@@ -72,6 +89,7 @@ void irq_handler(void) {
     if (!handled) {
         spurious++;
     }
+    cycles_in += cycle_count() - c0;
 }
 
 // TinyUSB's DWC2 glue masks the USB interrupt around its event queue with these.

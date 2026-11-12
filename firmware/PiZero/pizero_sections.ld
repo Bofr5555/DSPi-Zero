@@ -34,10 +34,19 @@ SECTIONS
     .bss (NOLOAD) : ALIGN(8) {
         __bss_start = .;
         *(.bss .bss.*)
-        *(.slot_rings)          /* DSPi's output slot rings (z4) */
+        *(.slot_rings)          /* DSPi's output slot rings (z4), read only by the CPU */
         *(COMMON)
         . = ALIGN(8);
         __bss_end = .;
+    } > RAM
+
+    /* DMA control blocks. mmu_enable() maps these whole megabytes as non-cacheable, so the DMA always
+     * sees what the CPU wrote with no cache maintenance. */
+    .nocache (NOLOAD) : ALIGN(0x100000) {
+        __nocache_start = .;
+        *(.nocache .nocache.*)
+        . = ALIGN(0x100000);
+        __nocache_end = .;
     } > RAM
 
     .stacks (NOLOAD) : ALIGN(16) {

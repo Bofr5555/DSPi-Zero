@@ -517,3 +517,111 @@ The 4% CPU figure was too high for a 1 GHz core next to the RP2350's 8 to 9% at 
 
 Per clock cycle the A53 is now only about as fast as the M33 on this code. DSPi's DSP code is scalar, single-precision floating point with long dependency chains, and the in-order A53 has a 4-cycle floating-point latency, where the M33's is about 1. Going further would mean restructuring DSPi's loops, for example processing channels side by side with NEON, which is outside this port's no-changes rule.
 
+## 18. Z5: I2S out on the PCM block
+
+*Added: 2026-11-12. Superseded by section 19, which moves every output to the SMI. `pcm_out.c` is still built but nothing binds it, so the PCM block is free for inputs.*
+
+`pizero_z4.img` played DSPi's I2S output on the Pi's PCM block.
+
+**Wiring for a PCM5102 module.** The PCM block's pins are fixed, whatever pins DSPi has stored for the slot.
+
+| DAC pin | Pi signal | Header pin |
+|---|---|---|
+| BCK | GPIO 18, PCM_CLK | 12 |
+| LCK (LRCLK) | GPIO 19, PCM_FS | 35 |
+| DIN | GPIO 21, PCM_DOUT | 40 |
+| SCK | Ground, so the PCM5102 makes its clock from BCK | 39 |
+| GND | Ground | 39 or 6 |
+| VIN | 5 V or 3.3 V, as the module expects | 2 or 1 |
+
+On most modules XSMT must be high (unmuted) and FMT low (I2S). Many boards strap these already.
+
+**How it works.**
+
+- **Which slot plays.** DSPi makes the first I2S slot the clock master. When that instance starts, `pico_shim.c` starts the PCM block on its ring at the frame DSPi expects the reader to be at. So setting slot 0 (outputs 1 and 2) to I2S in Console puts outputs 1 and 2 on the DAC.
+- **Clock.** The clock manager divides the 500 MHz PLLD by about 162.76 for 64 fs (48 kHz), with MASH 1 dithering the 12-bit fraction. That gives 47,999.976 Hz nominal, 44,099.975 Hz at 44.1 kHz and 96,000.096 Hz at 96 kHz. It has jitter, which the plan accepts for bring-up. DSPi's rate changes retune the divider in place.
+- **Format.** Philips I2S: 64 BCK per frame, two 32-bit slots, data one BCK after the LRCLK edge, changing on BCK falling, LRCLK low for left. The ring words are DSPi's 24-bit samples left-justified in 32 bits, so the PCM5102 reads them as 32-bit I2S.
+- **DMA.** `pcm_out.c` loops eight 64-frame control blocks over the 512-frame ring into the PCM FIFO, on a DMA channel the firmware leaves free (it chose 5). There are no interrupts. The read position gives the frame count modulo the ring, and the system timer resolves whole wraps, so a stalled main loop cannot lose count.
+- **Uncached memory.** The linker puts DSPi's slot rings and the DMA control blocks in their own megabyte (`.nocache`, now 1 to 2 MB), which `mmu_enable()` maps as normal, non-cacheable memory. So the DMA always reads what DSPi wrote, with no cache maintenance.
+- **One output clock.** `shim_output_clock()` counts the DMA's frames while the PCM block runs, and system timer time otherwise. Every ring, including the S/PDIF stand-ins, and the USB consumer advance by it. The TinyUSB FIFO level, which sets the feedback, therefore follows the DAC's clock rather than the timer's.
+
+**Bench checks** (`tools/z5_i2s_check.py`, which sets slot 0 to I2S and plays a quiet tone straight to the Pi). The stats reply is now version 5 (300 bytes), with the PCM status appended.
+
+- **Rates.** The DMA read 48,000.40 frames per second over 20 s, and 96,000.40 and 44,101.13 over 10 s each, within the 1 ms uptime resolution. `--rate` asks Core Audio to switch the Pi's own device rate, not the Mac's default output.
+- **Errors.** There were no PCM TX underflows, no DMA errors, and no slot 0 underrun frames or USB underruns inside any window. The slot 0 fill stayed near its 192-frame target.
+- **Restarts.** The UAC2 stream check passed five stop/start cycles with slot 0 on I2S.
+- **Not yet done.** The 30-minute fill run, and the listening test through a DAC.
+
+## 19. All output slots on the SMI
+
+*Added: 2026-11-12*
+
+`pizero_z4.img` now drives all four of DSPi's output slots from one SMI stream. Each slot is S/PDIF or I2S, as DSPi's output type for the slot says, and every pin changes on the same SMI cycle.
+
+### Pins
+
+| Signal | GPIO | SMI bit | Header pin |
+|---|---|---|---|
+| Slot 1 (outputs 1-2) | 8 | SD0 | 24 |
+| Slot 2 (outputs 3-4) | 9 | SD1 | 21 |
+| Slot 3 (outputs 5-6) | 10 | SD2 | 19 |
+| Slot 4 (outputs 7-8) | 11 | SD3 | 23 |
+| I2S BCK | 12 | SD4 | 32 |
+| I2S LRCLK | 13 | SD5 | 33 |
+
+A slot's pin carries S/PDIF or I2S data according to its type. BCK and LRCLK run while any slot is I2S. The UART (GPIO 14/15) and PCM pins (GPIO 18 to 21) are untouched. DSPi's stored pin numbers are ignored, as they were for the PCM block. MCK and the ADAT output are not done yet.
+
+### What the bench showed about the SMI
+
+These came from a temporary test request that streamed a pattern ring with the timing given.
+
+- **Register layout.** From Linux's `bcm2835_smi.h`. The SMI clock is the clock manager's SMI clock (`0x3F1010B0`), with DIVI in bits 15:12 and DIVF in bits 11:4.
+- **Fractional divider.** It works. Divider 13.5625 gave 12.291 M words/s against 12.289 predicted, where an integer 13 gave 12.818.
+- **Cycle length.** One write cycle is setup + strobe + hold SMI clocks. Pace does not add. 1 + 1 + 1 streams cleanly.
+- **Rate.** 12.288 M words/s (48 kHz at 256 fs) and 24.576 M (96 kHz) both stream with no DMA errors. With a pin driven, the real rate tops out near 37 M words/s at divider 2.
+- **Length.** `L` reads back as a running count of words sent, and the transfer ends when the count equals the programmed target exactly. Setting a target below the count does not end it: the 32-bit counter wraps past `0xFFFFFFFF` and runs on to the target. Rewriting `L` mid-transfer sets `SETERR` but takes effect without a gap. So the driver keeps the stream running forever by setting `L` one word behind the count about once a second.
+- **After the end.** Once the count reaches `L`, the SMI stops driving the pins but keeps draining its FIFO. A CPU probe of the pin level (bench request `0x4B`) showed this.
+
+### How it works
+
+- **One stream.** `smi_out.c` streams 16-bit words at 256 fs: 12.288 MHz at 48 kHz, 11.2896 MHz at 44.1 kHz and 24.576 MHz at 96 kHz. A 1 + 1 + 1 cycle runs from 500 MHz PLLD through the fractional divider. The 1/256 divider step leaves the rate up to about 70 ppm off nominal (48,003 Hz at 48 kHz), which the USB feedback absorbs.
+- **Ring and interrupts.** A DMA loop runs over a 128-frame ring of 256-word frames, with an interrupt every 16 frames. The interrupt refreshes `L` and calls the composer, which keeps the ring 64 frames ahead of the DMA. The ring is cached, and each composed block is cleaned out to SDRAM for the DMA.
+- **Composer.** `pico_shim.c` turns each slot ring into its pin's bits. An S/PDIF cell lasts 2 words and an I2S bit clock 4, at every rate. Slot n is always bit n, so the four slots merge with NEON shift-and-insert, 16 words at a time, and the clocks are ORed in.
+- **Ring contents as on the RP2350.** The S/PDIF ring writes now encode exactly as `pico_audio_spdif_multi`'s software encoder: its lookup table, preambles, channel status (with the sample-rate byte) and parity. Each ring holds NRZI cells, where a 1 toggles the line, and the composer turns them into levels with a running XOR. I2S words are stored as `pico_audio_i2s_multi` stores them: `(sample << 8) | 0x01`. The earlier stand-in stored raw values, so section 18's PCM output was 48 dB too quiet.
+- **Philips I2S timing.** 64 BCK per frame, LRCLK low for left, data changing on BCK falling and one bit clock behind LRCLK.
+- **Output clock.** `shim_output_clock()` is the composer's frame count. The composer is what reads the slot rings, so DSPi's fill, underrun and recovery accounting measure the real reader. Its lead adds about 1.3 ms of latency at 48 kHz.
+- **Fill servo.** On the RP2350, DSPi's own feedback steers the slot fill. Here the consumer does it: each 1 ms tick it moves up to 2 frames more or fewer than the composer took, so slot 0's mid-block fill sits at DSPi's target.
+- **Uncached memory.** Only DMA control blocks remain uncached. Uncached slot and SMI rings had made the composer cost 3,512 cycles a frame.
+
+### USB feedback: macOS reads it per service interval
+
+The SMI's 64 ppm offset exposed a feedback fault that every earlier clock had hidden: the timer ran exactly at nominal and the PCM clock was within 1 ppm. TinyUSB's FIFO-count feedback is in samples per 125 µs microframe. The host ignored it and ran at nominal, the FIFO drained at 12 bytes/s, and underruns began after about 55 s.
+
+Fixed values set with bench request `0x48` showed why:
+
+| Feedback value | FIFO change |
+|---|---|
+| Per microframe, +500 ppm | +0.0 bytes/s |
+| Per microframe, -500 ppm | +6.0 bytes/s |
+| Per 1 ms, +500 ppm | +83.0 bytes/s |
+| Per 1 ms, -500 ppm | -85.0 bytes/s |
+
+macOS reads the value in samples per data-endpoint service interval: 1 ms here, with `bInterval` 4. `main_z4.c` now sets the feedback itself in those units. It is nominal plus a proportional term on the smoothed FIFO level, which held the FIFO within about 100 bytes of half full. Linux detects the feedback scale by its size. How Windows reads it at this `bInterval` is not yet checked.
+
+### Results
+
+`tools/smi_check.py` sets the slot types with DSPi's `REQ_SET_OUTPUT_TYPE` and plays a tone straight to the Pi. It snapshots composed frames (bench request `0x49`) and decodes every slot from the pin bits: I2S by sampling data on BCK rising edges, S/PDIF by finding preambles and checking every subframe's parity.
+
+- **Decoding.** Every slot decodes at 44.1, 48 and 96 kHz in both I2S and S/PDIF, with zero parity or clock errors. The SMI frame rate matches the sample rate.
+- **Stability.** With `--watch`, 30 s at each rate and 120 s at 48 kHz showed no slot underruns, ring drops, USB underruns or late compositions. The slot fill held near DSPi's target and the FIFO near half full.
+- **Restarts.** The UAC2 stream check passed three stop/start cycles.
+- **CPU at 48 kHz with four S/PDIF slots.** DSPi's block, including the S/PDIF encoding, takes 34.7 µs per 48 frames, about 3.5%. Interrupts (the composer and USB) take 8%. The composer alone is 930 cycles a frame plus 390 for the cache clean, about 6% at 48 kHz and 12% at 96 kHz. `z4_perf.py` now subtracts every interrupt, not only USB's.
+
+### Not done yet
+
+- A listening test through a DAC or S/PDIF receiver on these pins.
+- A logic-analyser look at pin-to-pin skew and the clock's jitter.
+- MCK, the ADAT output, and which pins they take.
+- Windows' reading of the feedback value.
+- Moving the composer to a second core, if the load matters at 96 kHz.
+

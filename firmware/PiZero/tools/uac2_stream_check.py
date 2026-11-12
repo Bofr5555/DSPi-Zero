@@ -65,10 +65,12 @@ def read_stats(dev):
 class Tone:
     """-20 dBFS 1 kHz stereo tone on a PortAudio stream opened on one named device."""
 
-    def __init__(self, device_substring, rate=48000):
+    def __init__(self, device_substring, rate=48000, set_device_rate=False):
         import sounddevice as sd
         self.sd = sd
         self.rate = rate
+        # Asks Core Audio to switch this device's own rate, instead of resampling to it.
+        self.extra = sd.CoreAudioSettings(change_device_parameters=True) if set_device_rate else None
         self.amp = int(32767 * 0.1)
         matches = [i for i, d in enumerate(sd.query_devices())
                    if device_substring in d["name"] and d["max_output_channels"] >= 2]
@@ -97,7 +99,8 @@ class Tone:
 
     def start(self):
         self.stream = self.sd.RawOutputStream(samplerate=self.rate, channels=2, dtype="int16", device=self.device,
-                                              callback=self._callback, blocksize=480)
+                                              callback=self._callback, blocksize=480,
+                                              extra_settings=self.extra)
         self.stream.start()
 
     def stop(self):

@@ -17,7 +17,7 @@ EVENTS = ("inst", "l1i_refill", "l1d_refill", "l2_refill", "br_mispred")
 
 
 def perf(dev):
-    raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 264, timeout=500))
+    raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 348, timeout=500))
     s = read_stats(dev)
     if s["version"] < 4 or len(raw) < 264:
         raise SystemExit(f"FAIL: stats version {s['version']}, need 4 (load the new pizero_z4.img)")
@@ -58,14 +58,14 @@ def main():
     s = b["s"]
     hz = 1e9
     print(f"{n} blocks in {dt:.2f} s, {s['frames'] / max(s['blocks'], 1):.1f} frames each, cpu0_load {s['cpu0']}%")
-    print(f"per block: {cyc / n:.0f} cycles ({cyc / n / hz * 1e6:.1f} us at 1 GHz), of which USB IRQ "
-          f"{irq / n:.0f} ({diff(a, b, 'irqs') / n:.2f} IRQs per block)")
+    print(f"per block: {cyc / n:.0f} cycles ({cyc / n / hz * 1e6:.1f} us at 1 GHz), of which in interrupts "
+          f"{irq / n:.0f} ({diff(a, b, 'irqs') / n:.2f} interrupts per block)")
     dsp = cyc - irq
     inst = diff(a, b, "inst")
     print(f"DSP only: {dsp / n:.0f} cycles, {inst / n:.0f} instructions, IPC {inst / max(dsp, 1):.2f}")
     for k in EVENTS[1:]:
         print(f"    {k}: {diff(a, b, k) / n:.1f} per block")
-    print(f"USB IRQ overall: {diff(a, b, 'irq_all') / dt / hz * 100:.2f}% of the CPU")
+    print(f"interrupts overall: {diff(a, b, 'irq_all') / dt / hz * 100:.2f}% of the CPU")
     return 0
 
 

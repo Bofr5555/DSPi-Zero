@@ -40,21 +40,19 @@
 #include "z4.h"
 #include "z4_globals.h"
 #include "pmu.h"
+#include "pcm_out.h"
+#include "smi_out.h"
 #include "z4_prof.h"
 
 uint32_t tusb_time_millis_api(void) {
     return board_micros() / 1000u;
 }
 
-static volatile uint32_t irq_cycles;     // cycles spent in usb_irq(), wrapping
-
 static void usb_irq(void) {
-    uint32_t t0 = pmu_cycles();
     tud_int_handler(0);
     // Read back from the controller so its interrupt-clear writes have landed before we return.
     // Otherwise the line is still high and the IRQ fires again with nothing pending.
     (void)*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + 0x014);    // GINTSTS
-    irq_cycles += pmu_cycles() - t0;
 }
 
 // usb_sound_card_init() in DSPi's usb_audio.c calls tud_init(), whose tud_rhport_init() is renamed to
@@ -135,16 +133,22 @@ typedef struct {
     uint32_t pmu_counters;          // event counters the core has, 0 if the counters are unused
     uint32_t perf_blocks;
     uint32_t perf_cycles;           // inside the block, interrupts included
-    uint32_t perf_irq_cycles;       // of those, cycles in usb_irq()
+    uint32_t perf_irq_cycles;       // of those, cycles in interrupt handlers (USB and the SMI composer)
     uint32_t perf_irqs;             // interrupts taken inside the block
     uint32_t perf_ev[PMU_N_EVENTS]; // instructions, L1I, L1D and L2 refills, branch mispredicts
-    uint32_t irq_cycles_all;        // all usb_irq() cycles
+    uint32_t irq_cycles_all;        // all interrupt handler cycles
+    pcm_out_status_t pcm;           // version 5: the PCM block (Z5 I2S out)
+    uint32_t output_clock;          // shim_output_clock(), frames
+    smi_out_status_t smi;           // version 7: the SMI output stream
 } z4_stats_t;
 
 int8_t dcd_dwc2_iso_parity(uint8_t dir, uint8_t epnum);
 #define DWC2_R(off) (*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + (off)))
 
 static volatile u2_stats_t stats;
+static uint32_t fb_override;    // feedback_task(): bench-fixed feedback value, 0 for automatic
+static uint32_t fb_value;
+
 static volatile bool reboot_requested;
 
 static uint32_t dspi_blocks, dspi_frames, dspi_us_last, dspi_us_max;
@@ -307,8 +311,8 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 void tud_audio_feedback_params_cb(uint8_t func_id, uint8_t alt_itf, audio_feedback_params_t *feedback_param) {
     (void)func_id;
     (void)alt_itf;
-    // TinyUSB derives the feedback from how full its FIFO is, which the paced consumer below drains.
-    feedback_param->method = AUDIO_FEEDBACK_METHOD_FIFO_COUNT;
+    // feedback_task() below sets the feedback itself, from how full TinyUSB's FIFO is.
+    feedback_param->method = AUDIO_FEEDBACK_METHOD_DISABLED;
     feedback_param->sample_freq = current_rate;
 }
 
@@ -466,7 +470,7 @@ typedef struct {
 // Wire layout read by the bench tools: version 1 fields unchanged, the DSPi block appended.
 _Static_assert(offsetof(u2_reply_t, dspi) == 116, "0x4F reply: DSPi block offset");
 _Static_assert(offsetof(z4_stats_t, peaks) == 28 && offsetof(z4_stats_t, slot0_fill) == 64, "0x4F reply layout");
-_Static_assert(sizeof(u2_reply_t) == 264, "0x4F reply size");
+_Static_assert(sizeof(u2_reply_t) == 348, "0x4F reply size");
 
 static void fill_dspi_stats(z4_stats_t *z) {
     memset(z, 0, sizeof(*z));
@@ -506,7 +510,10 @@ static void fill_dspi_stats(z4_stats_t *z) {
     z->perf_irq_cycles = perf_irq_cycles;
     z->perf_irqs = perf_irqs;
     memcpy(z->perf_ev, perf_ev, sizeof(perf_ev));
-    z->irq_cycles_all = irq_cycles;
+    z->irq_cycles_all = irq_cycles();
+    pcm_out_status(&z->pcm);
+    z->output_clock = shim_output_clock();
+    smi_out_status(&z->smi);
 }
 
 bool dspi_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req);
@@ -554,6 +561,35 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         return true;
     }
+    // 0x48: fixes the feedback value at wIndex << 16 | wValue (16.16), or 0 for automatic.
+    if (bench && req->bRequest == 0x48 && !in) {
+        if (stage == CONTROL_STAGE_SETUP) {
+            fb_override = (uint32_t)req->wIndex << 16 | req->wValue;
+            return tud_control_status(rhport, req);
+        }
+        return true;
+    }
+    // 0x49: up to 16 composed SMI frames not yet sent: the first frame's number, then 512 bytes a frame.
+    if (bench && req->bRequest == 0x49 && in) {
+        static uint32_t snap[1 + 16 * SMI_FRAME_WORDS / 2];
+        if (stage == CONTROL_STAGE_SETUP) {
+            uint32_t n = req->wValue < 1 ? 1 : (req->wValue > 16 ? 16 : req->wValue);
+            snap[0] = shim_smi_snapshot((uint16_t *)&snap[1], n);
+            uint32_t len = 4u + n * SMI_FRAME_WORDS * 2u;
+            return tud_control_xfer(rhport, req, snap, req->wLength < len ? req->wLength : (uint16_t)len);
+        }
+        return true;
+    }
+    // 0x4B: count level changes on GPIO wValue over wIndex ms; replies toggles and samples.
+    if (bench && req->bRequest == 0x4B && in) {
+        static uint32_t probe_reply[2];
+        if (stage == CONTROL_STAGE_SETUP) {
+            probe_reply[0] = smi_out_probe_toggles(req->wValue, req->wIndex > 100 ? 100 : req->wIndex,
+                                                   &probe_reply[1]);
+            return tud_control_xfer(rhport, req, probe_reply, req->wLength < 8 ? req->wLength : 8);
+        }
+        return true;
+    }
     if (bench && req->bRequest == 0x4E && in) {
         static uint32_t count_reply;
         if (stage != CONTROL_STAGE_SETUP) {
@@ -575,7 +611,7 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
             return true;
         }
         reply.magic = U2_STATS_MAGIC;
-        reply.version = 4;
+        reply.version = 7;
         reply.uptime_ms = board_micros() / 1000u;
         reply.rate = current_rate;
         reply.alt = current_alt;
@@ -682,7 +718,7 @@ static void run_block(uint32_t frames, uint8_t alt) {
     total_samples_produced += frames;
 
     pmu_snap_t a, b;
-    uint32_t irq_c0 = irq_cycles, irq_n0 = irq_count();
+    uint32_t irq_c0 = irq_cycles(), irq_n0 = irq_count();
     uint32_t t0 = board_micros();
     pmu_read(&a);
     z4_prof_in_block = true;
@@ -692,7 +728,7 @@ static void run_block(uint32_t frames, uint8_t alt) {
     uint32_t us = board_micros() - t0;
     perf_blocks++;
     perf_cycles += b.cycles - a.cycles;
-    perf_irq_cycles += irq_cycles - irq_c0;
+    perf_irq_cycles += irq_cycles() - irq_c0;
     perf_irqs += irq_count() - irq_n0;
     for (int i = 0; i < PMU_N_EVENTS; i++) {
         perf_ev[i] += b.ev[i] - a.ev[i];
@@ -718,10 +754,38 @@ static void stream_start(void) {
     dspi_us_total = 0;
 }
 
+// Feedback in 16.16 samples per data-endpoint service interval (2^(bInterval-1) microframes, 1 ms here),
+// which is how macOS reads it: a per-microframe value (TinyUSB's FIFO-count method) is out of range and
+// ignored, so the host runs at nominal. Bring-up doc section 19 has the measurement. The value is
+// nominal plus a proportional term on the smoothed FIFO level. Bench request 0x48 can fix it.
+#define FB_UFRAMES (1u << (UAC2_DATA_INTERVAL - 1u))
+#define FB_GAIN 6                   // 16.16 units per byte below half full: 64 ppm costs about 35 bytes
+
+static void feedback_task(uint16_t level) {
+    static uint32_t avg_q8;     // FIFO level, bytes, 8 fractional bits
+    uint32_t half = CFG_TUD_AUDIO_FUNC_1_EP_OUT_SW_BUF_SZ / 2;
+    if (avg_q8 == 0) {
+        avg_q8 = half << 8;
+    }
+    avg_q8 = avg_q8 - (avg_q8 >> 6) + ((uint32_t)level << 2);     // about 64 ticks
+    uint32_t nominal = (uint32_t)(((uint64_t)current_rate << 16) * FB_UFRAMES / 8000u);
+    int32_t fb = (int32_t)nominal + ((int32_t)(half << 8) - (int32_t)avg_q8) * FB_GAIN / 256;
+    int32_t span = (int32_t)(nominal / 100u);   // at most 1% either way
+    if (fb > (int32_t)nominal + span) {
+        fb = (int32_t)nominal + span;
+    } else if (fb < (int32_t)nominal - span) {
+        fb = (int32_t)nominal - span;
+    }
+    fb_value = fb_override ? fb_override : (uint32_t)fb;
+    tud_audio_fb_set(fb_value);
+}
+
 // While another input is selected the host's stream is drained and dropped, as DSPi ignores it.
+// Each 1 ms tick takes as many frames as the output clock advanced: the DAC's own rate while the PCM
+// block plays, so the FIFO level, and with it the host's feedback, follows the DAC.
 static void consume_task(void) {
     static uint32_t last_us;
-    static uint32_t frac;       // frames * 1e6, carried between ticks for 44.1 kHz
+    static uint32_t last_clk;   // shim_output_clock() at the last tick
     static bool running;
     static bool busy;
 
@@ -732,15 +796,20 @@ static void consume_task(void) {
     if (now - last_us < 1000u) {
         return;
     }
-    uint32_t elapsed = now - last_us;
     last_us = now;
-    if (elapsed > 10000u) {
-        elapsed = 1000u;    // first tick, or the loop was held up: do not try to catch up
+    uint32_t clk = shim_output_clock();
+    uint32_t frames = clk - last_clk;
+    last_clk = clk;
+    if (frames > current_rate / 100u) {
+        frames = current_rate / 1000u;  // first tick, or the loop was held up: do not try to catch up
     }
 
     uint8_t alt = current_alt;
     uint16_t level = tud_audio_available();
     stats.fifo_level = level;
+    if (current_alt != 0) {
+        feedback_task(level);
+    }
     bool usb_source = active_input_source == INPUT_SOURCE_USB;
     if (alt == 0) {
         if (running) {
@@ -748,7 +817,6 @@ static void consume_task(void) {
         }
         running = false;
         consumer_running = false;
-        frac = 0;
         return;
     }
     if (!running) {
@@ -760,21 +828,28 @@ static void consume_task(void) {
         stream_start();
         busy = false;
         last_us = board_micros();
-        elapsed = 1000u;
+        last_clk = shim_output_clock();
+        frames = current_rate / 1000u;
     } else if (usb_source && audio_state.freq != current_rate) {
         busy = true;
         stream_start();     // the host changed rate without closing the stream
         busy = false;
         last_us = board_micros();
-        elapsed = 1000u;
-        frac = 0;
+        last_clk = shim_output_clock();
+        frames = current_rate / 1000u;
     }
     consumer_running = usb_source;
 
     uint32_t bytes_per_frame = 2u * (alt == 1 ? 2u : 3u);
-    frac += current_rate * elapsed;
-    uint32_t frames = frac / 1000000u;
-    frac -= frames * 1000000u;
+    // Nothing else steers the slot fill (on the RP2350, DSPi's feedback does), so nudge it towards DSPi's
+    // target by up to 2 frames a tick. The FIFO absorbs the difference and the feedback re-centres it.
+    // The fill is read before this tick's write, so half the write is added to servo the mid-block fill.
+    if (usb_source) {
+        int32_t mid = output_ring_fill_signed(0) + (int32_t)frames / 2;
+        int32_t corr = ((int32_t)output_ring_target_frames - mid) / 16;
+        corr = corr > 2 ? 2 : (corr < -2 ? -2 : corr);
+        frames = (int32_t)frames + corr > 0 ? (uint32_t)((int32_t)frames + corr) : 0u;
+    }
     uint32_t avail = level / bytes_per_frame;
     if (avail < frames) {
         stats.underruns++;
@@ -860,6 +935,9 @@ int main(void) {
     mbox_set_power_state(VCMAILBOX_DEVICE_USB_HCD, 1);
     uart_set_buffered(1);
 
+    // Outputs first, with interrupts on for its composer, so DSPi's slots start on the SMI's frame clock.
+    shim_smi_start();
+    irq_global_enable();
     z4_dspi_init();
 
     irq_set_handler(IRQ_USB, usb_irq);

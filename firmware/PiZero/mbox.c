@@ -148,6 +148,12 @@ uint64_t mbox_board_serial(void) {
     return v ? ((uint64_t)v[1] << 32) | v[0] : 0;
 }
 
+uint32_t mbox_dma_channels(void) {
+    // GET_DMA_CHANNELS: a mask of the DMA channels the firmware leaves to the ARM.
+    volatile uint32_t *v = mbox_query(0x00060001u, 4, 0, 0);
+    return v ? v[0] : 0;
+}
+
 uint32_t mbox_firmware_revision(void) {
     volatile uint32_t *v = mbox_query(VCMAILBOX_TAG_GET_FIRMWARE_REVISION, 4, 0, 0);
     return v ? v[0] : 0;

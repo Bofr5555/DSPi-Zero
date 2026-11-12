@@ -130,13 +130,17 @@ Drive the PCM block as I2S master into the DAC module, clocked from PLLD through
 
 **Pass:** host audio plays cleanly through the DAC with DSP applied, and the buffer fill stays centred over a 30-minute run.
 
+**Status (2026-11-12): output path working, listening test pending.** When slot 0 is set to I2S in DSPi (Console, or `REQ_SET_OUTPUT_TYPE`), DSPi's clock-master I2S slot plays on the PCM block through a DMA loop over DSPi's own slot ring, as the RP2350's free-running DMA does. Every other ring and the USB consumer now follow the DMA's frame count, so the host's feedback tracks the DAC clock. The DMA reads at the sample rate at 44.1, 48 and 96 kHz with no PCM underflows or DMA errors. Details are in `PiZero_Z0_bringup.md` section 18.
+
+**Status (2026-11-12): all four output slots on the SMI, listening test pending.** The section 4 output design now runs. One SMI stream at 256 fs carries every slot as S/PDIF or I2S, on GPIO 8 to 11, with I2S BCK and LRCLK on GPIO 12 and 13. Every slot decodes correctly from the composed stream at 44.1, 48 and 96 kHz, and the stream held steady with no underruns. The PCM block is free again for inputs. Along the way it turned out macOS reads High Speed feedback per data-endpoint service interval, so the firmware now sets the feedback itself. Details are in `PiZero_Z0_bringup.md` section 19.
+
 ## 6. Bench measurements for the I/O plan
 
 These come after Z5. They decide whether the section 4 design is possible or only the output half of it.
 
 | Measurement | Why it matters |
 |---|---|
-| Maximum sustained SMI write rate, with DMA, on 8 and 16 pins | Must reach 12.288 MHz (256 fs at 48 kHz) for ADAT and S/PDIF on one stream. Higher rates need more. |
+| Maximum sustained SMI write rate, with DMA, on 8 and 16 pins | Must reach 12.288 MHz (256 fs at 48 kHz) for ADAT and S/PDIF on one stream. Higher rates need more. **Measured 2026-11-12 on 16 pins: 12.288 and 24.576 MHz stream cleanly, and the real ceiling is about 37 MHz (bring-up section 19).** |
 | Maximum sustained SMI read rate | Decides whether SMI could ever capture inputs. |
 | Maximum PCM bit clock in master receive mode | Sets how fast S/PDIF and ADAT can be oversampled, and therefore which input rates are possible. |
 | Pin-to-pin skew across SMI outputs | Confirms the slot alignment claim with a logic analyser. |
