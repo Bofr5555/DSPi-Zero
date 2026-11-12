@@ -122,6 +122,8 @@ DSPi Console will need a small patch to name the new platform. The STM32 port ne
 
 **Status (2026-11-11): Z4a done on the Zero 2 W (pipeline only).** DSPi's unchanged float pipeline ran on the UAC2 stream through 10 stream restarts with no lost audio. DSPi reported `cpu0_load` 35%, with blocks averaging 340 us for 1 ms of audio. That is single core with the D-cache off, so it is a starting figure, not a tuned one. Z4b brings in vendor commands, bulk params and DSPi Console, with a new platform ID. Details are in `PiZero_Z0_bringup.md` section 15.
 
+**Status (2026-11-12): Z4 passed on the Zero 2 W.** Z4b added DSPi's vendor commands, bulk params, presets and notifications, all compiled unchanged, plus the MMU and D-cache and the full 1000 MHz ARM clock. DSPi Console connects, names the board "Raspberry Pi Zero 2 W", shows live input and output meters, and applies EQ changes. `cpu0_load` is 2% at 48 kHz stereo, with blocks averaging 24.2 us, after replacing newlib-nano's byte-at-a-time `memset` (bring-up doc section 17). DSPi's control-plane harness passes everything except platform differences, stale expectations and the RTA busy-time budget, which is still to investigate. Details are in `PiZero_Z0_bringup.md` section 16.
+
 ### Z5. Stereo I2S out (listening test)
 
 Drive the PCM block as I2S master into the DAC module, clocked from PLLD through the clock manager's fractional divider. This clock has jitter, which is acceptable for bring-up. Replace the timer pacing with PCM DMA consumption, and derive the USB feedback from it.

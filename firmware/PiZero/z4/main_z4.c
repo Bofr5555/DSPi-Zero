@@ -39,16 +39,22 @@
 
 #include "z4.h"
 #include "z4_globals.h"
+#include "pmu.h"
+#include "z4_prof.h"
 
 uint32_t tusb_time_millis_api(void) {
     return board_micros() / 1000u;
 }
 
+static volatile uint32_t irq_cycles;     // cycles spent in usb_irq(), wrapping
+
 static void usb_irq(void) {
+    uint32_t t0 = pmu_cycles();
     tud_int_handler(0);
     // Read back from the controller so its interrupt-clear writes have landed before we return.
     // Otherwise the line is still high and the IRQ fires again with nothing pending.
     (void)*(volatile uint32_t *)(USB_OTG_GLOBAL_BASE + 0x014);    // GINTSTS
+    irq_cycles += pmu_cycles() - t0;
 }
 
 // usb_sound_card_init() in DSPi's usb_audio.c calls tud_init(), whose tud_rhport_init() is renamed to
@@ -125,6 +131,14 @@ typedef struct {
     uint32_t vendor_stalls;         // vendor requests DSPi stalled
     uint32_t notify_packets;        // event packets sent on EP 0x83
     uint32_t notify_keepalives;     // 1-byte idle packets sent on EP 0x83
+    // Version 4: performance counters over process_input_block(), all wrapping totals.
+    uint32_t pmu_counters;          // event counters the core has, 0 if the counters are unused
+    uint32_t perf_blocks;
+    uint32_t perf_cycles;           // inside the block, interrupts included
+    uint32_t perf_irq_cycles;       // of those, cycles in usb_irq()
+    uint32_t perf_irqs;             // interrupts taken inside the block
+    uint32_t perf_ev[PMU_N_EVENTS]; // instructions, L1I, L1D and L2 refills, branch mispredicts
+    uint32_t irq_cycles_all;        // all usb_irq() cycles
 } z4_stats_t;
 
 int8_t dcd_dwc2_iso_parity(uint8_t dir, uint8_t epnum);
@@ -136,6 +150,7 @@ static volatile bool reboot_requested;
 static uint32_t dspi_blocks, dspi_frames, dspi_us_last, dspi_us_max;
 static uint64_t dspi_us_total;
 static uint32_t vendor_requests, vendor_stalls, notify_packets, notify_keepalives;
+static uint32_t pmu_counters, perf_blocks, perf_cycles, perf_irq_cycles, perf_irqs, perf_ev[PMU_N_EVENTS];
 static volatile bool consumer_running;
 
 void tud_mount_cb(void) {
@@ -451,7 +466,7 @@ typedef struct {
 // Wire layout read by the bench tools: version 1 fields unchanged, the DSPi block appended.
 _Static_assert(offsetof(u2_reply_t, dspi) == 116, "0x4F reply: DSPi block offset");
 _Static_assert(offsetof(z4_stats_t, peaks) == 28 && offsetof(z4_stats_t, slot0_fill) == 64, "0x4F reply layout");
-_Static_assert(sizeof(u2_reply_t) == 220, "0x4F reply size");
+_Static_assert(sizeof(u2_reply_t) == 264, "0x4F reply size");
 
 static void fill_dspi_stats(z4_stats_t *z) {
     memset(z, 0, sizeof(*z));
@@ -485,6 +500,13 @@ static void fill_dspi_stats(z4_stats_t *z) {
     z->vendor_stalls = vendor_stalls;
     z->notify_packets = notify_packets;
     z->notify_keepalives = notify_keepalives;
+    z->pmu_counters = pmu_counters;
+    z->perf_blocks = perf_blocks;
+    z->perf_cycles = perf_cycles;
+    z->perf_irq_cycles = perf_irq_cycles;
+    z->perf_irqs = perf_irqs;
+    memcpy(z->perf_ev, perf_ev, sizeof(perf_ev));
+    z->irq_cycles_all = irq_cycles;
 }
 
 bool dspi_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_request_t const *req);
@@ -523,12 +545,37 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         return true;
     }
+    // Profiler: 0x4D starts sampling every wValue us (0 stops). 0x4E reads the sample count with
+    // wValue 0xFFFF, otherwise 4 KB of samples at chunk wValue.
+    if (bench && req->bRequest == 0x4D && !in) {
+        if (stage == CONTROL_STAGE_SETUP) {
+            z4_prof_start(req->wValue);
+            return tud_control_status(rhport, req);
+        }
+        return true;
+    }
+    if (bench && req->bRequest == 0x4E && in) {
+        static uint32_t count_reply;
+        if (stage != CONTROL_STAGE_SETUP) {
+            return true;
+        }
+        if (req->wValue == 0xFFFF) {
+            count_reply = z4_prof_count;
+            return tud_control_xfer(rhport, req, &count_reply, req->wLength < 4 ? req->wLength : 4);
+        }
+        uint32_t first = (uint32_t)req->wValue * 1024u;
+        if (first >= Z4_PROF_MAX) {
+            return false;
+        }
+        uint16_t len = req->wLength < 4096 ? req->wLength : 4096;
+        return tud_control_xfer(rhport, req, &z4_prof_samples[first], len);
+    }
     if (bench && req->bRequest == REQ_Z_GET_STATS && in) {
         if (stage != CONTROL_STAGE_SETUP) {
             return true;
         }
         reply.magic = U2_STATS_MAGIC;
-        reply.version = 3;
+        reply.version = 4;
         reply.uptime_ms = board_micros() / 1000u;
         reply.rate = current_rate;
         reply.alt = current_alt;
@@ -634,9 +681,22 @@ static void run_block(uint32_t frames, uint8_t alt) {
     }
     total_samples_produced += frames;
 
+    pmu_snap_t a, b;
+    uint32_t irq_c0 = irq_cycles, irq_n0 = irq_count();
     uint32_t t0 = board_micros();
+    pmu_read(&a);
+    z4_prof_in_block = true;
     process_input_block(frames);
+    z4_prof_in_block = false;
+    pmu_read(&b);
     uint32_t us = board_micros() - t0;
+    perf_blocks++;
+    perf_cycles += b.cycles - a.cycles;
+    perf_irq_cycles += irq_cycles - irq_c0;
+    perf_irqs += irq_count() - irq_n0;
+    for (int i = 0; i < PMU_N_EVENTS; i++) {
+        perf_ev[i] += b.ev[i] - a.ev[i];
+    }
 
     dspi_blocks++;
     dspi_frames += frames;
@@ -783,6 +843,7 @@ static void set_serial_string(void) {
 int main(void) {
 #if BCM_VERSION == 2837
     mmu_enable();   // D-cache on: DSP data no longer comes from SDRAM on every access
+    pmu_counters = pmu_init();
 #endif
     // The VideoCore keeps the ARM at arm_freq_min (600 MHz on a Zero 2 W) until the OS asks for more,
     // as Linux's cpufreq does. Ask for the maximum; the firmware still throttles if it gets too hot.

@@ -62,6 +62,9 @@ _start:
     mov     r1, #0
     mcr     p15, 4, r1, c1, c1, 3       /* HSTR: no CP15 traps */
     mcr     p15, 4, r1, c1, c1, 0       /* HCR: no virtualisation traps or routing */
+    mrc     p15, 0, r1, c9, c12, 0      /* PMCR */
+    ubfx    r1, r1, #11, #5             /* PMCR.N, the number of event counters */
+    mcr     p15, 4, r1, c1, c1, 1       /* HDCR: SVC owns every PMU counter, no PMU or debug traps */
     isb
     bic     r0, r0, #0x1F
     orr     r0, r0, #0x13               /* SVC */
@@ -131,6 +134,9 @@ _start:
     .globl boot_info
 boot_info:
     .space  16
+    .globl irq_return_pc
+irq_return_pc:
+    .space  4
 
 /* VBAR needs 32-byte alignment. */
     .section .text.vectors, "ax"
@@ -168,6 +174,8 @@ irq_entry:
     sub     lr, lr, #4
     srsdb   sp!, #0x12                  /* lr_irq and spsr_irq onto the IRQ stack */
     push    {r0-r3, r12, lr}            /* 8 + 24 bytes keeps the stack 8-byte aligned */
+    ldr     r1, =irq_return_pc          /* the interrupted PC, for the sampling profiler */
+    str     lr, [r1]
     vmrs    r0, fpscr
     push    {r0, r1}
     vpush   {d0-d7}

@@ -278,10 +278,12 @@ if(PIZERO_BOARD STREQUAL "zero2")
     target_compile_options(dspi_z4 PRIVATE ${COMMON_FLAGS} -fhosted -O2 -g -std=gnu17 -fcommon -w)
     target_link_libraries(dspi_z4 PUBLIC m)
     # Per-file optimisation as in firmware/DSPi/CMakeLists.txt.
-    foreach(f usb_audio.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c siggen.c upmix.c adat_output.c)
+    foreach(f usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c
+              spdif_input.c i2s_input.c input_servo.c lg_sound_sync.c dac_hw_mute.c siggen.c upmix.c adat_output.c
+              adat_input.c loopback.c)
         set_property(SOURCE ${DSPI_DIR}/${f} APPEND PROPERTY COMPILE_OPTIONS -O3)
     endforeach()
-    foreach(f dsp_pipeline.c subharm.c tube.c)
+    foreach(f dsp_pipeline.c subharm.c tube.c rta_bass.c)
         set_property(SOURCE ${DSPI_DIR}/${f} APPEND PROPERTY COMPILE_OPTIONS -O3 -ffp-contract=off)
     endforeach()
     # usb_audio.c holds the pipeline's globals and usb_sound_card_init(), and also DSPi's UAC1 class
@@ -310,9 +312,10 @@ if(PIZERO_BOARD STREQUAL "zero2")
         tud_descriptor_string_cb=dspi_tud_descriptor_string_cb
     )
 
-    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c z4/main_z4.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
+    add_executable(pizero_z4 ${PLATFORM_SRC} irq.c mem_ops.c z4/main_z4.c z4/z4_prof.c z4/z4_mainloop.c z4/z4_globals.c z4/dspi_standins.c pico_shim/pico_shim.c uac2/usb_descriptors.c)
     target_include_directories(pizero_z4 BEFORE PRIVATE ${CMAKE_CURRENT_LIST_DIR}/uac2 ${CMAKE_CURRENT_LIST_DIR}/pico_shim)
     target_link_libraries(pizero_z4 PRIVATE dspi_z4 tinyusb_uac2)
+    set_property(SOURCE mem_ops.c APPEND PROPERTY COMPILE_OPTIONS -fno-builtin -fno-tree-loop-distribute-patterns)
     pizero_image(pizero_z4)
 else()
     # ARM1176 cannot assemble usb_audio.c's RP2350 24-bit unpack (inline sbfx/bfi need ARMv6T2).

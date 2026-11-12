@@ -481,4 +481,39 @@ The 40 underruns outside the windows come at stream edges, as the FIFO drains af
 | 1 | RTA busy time over budget, measured with the D-cache off. |
 | 1 | The RTA did not auto-stop, most likely because Console's spectrum view was reading the analyser at the same time. |
 
-A rerun with the D-cache on and Console closed is still to do.
+**Rerun on 2026-11-12, with the D-cache on and the ARM at 1000 MHz.**
+
+- **All groups except RTA, Console open:** 107 of 130 passed, with 8 failures, 0 errors and 15 skipped. The failures were exactly the expected and stale ones above, and the `0x4F` test now passes.
+- **RTA group, Console closed:** 5 of 8 passed, with 2 failures and 1 skipped.
+  - Auto-off now passes, which confirms Console's spectrum view caused that failure.
+  - Sine placement, pink-noise flatness, channel rotation and frame sequence all pass.
+  - Config validation still fails, for DSPi's USB acknowledgement reason above.
+  - Busy time fell from 23049 to 13760 us per second. That is 1.4% of the CPU, but still over the harness's 5000 us RP2350 budget. Cache alone gave only 1.7 times, so the window probably includes interrupt time, or the FFT is not using NEON. This is the one item still to investigate.
+
+**Console check on 2026-11-12.** With audio playing straight to "Weeb Labs DSPi Zero", DSPi Console showed the input and output meters moving, and an EQ change took effect on the output. That completes Z4 on the Zero 2 W.
+
+## 17. Z4 block time: newlib-nano's memset
+
+*Added: 2026-11-12*
+
+The 4% CPU figure was too high for a 1 GHz core next to the RP2350's 8 to 9% at 307.2 MHz. In cycles, the Pi was spending 44,700 per 1 ms block against roughly 26,000 on the Cortex-M33.
+
+**Tools.** Two bench tools now show where the time goes.
+- **Counters.** `z4/pmu.h` turns on the Cortex-A53 cycle counter and five event counters. Startup now sets HDCR so SVC mode owns them. The `0x4F` stats reply (version 4, 264 bytes) adds per-block cycles, the USB interrupt's share, instructions and cache refills. `tools/z4_perf.py` reports them.
+- **Sampling profiler.** `z4/z4_prof.c` takes system timer channel 3 interrupts about every 37 us and records the interrupted PC, which `startup.S` now saves as `irq_return_pc`, while `process_input_block()` runs. Bench requests `0x4D` (start or stop) and `0x4E` (read) serve it. `tools/z4_prof.py ELF` maps the samples to functions.
+
+**Cause.** 45% of the block time was in `memset`. We link newlib-nano, whose `memset` and `memcpy` are Thumb byte loops. DSPi clears its output and staging buffers with `memset` on every block, and on the RP2350 the Pico SDK replaces both with fast versions. The USB interrupt was not a factor: 343 cycles per block, and 0.88% of the CPU overall.
+
+**Fix.** `mem_ops.c` supplies NEON `memset` and `memcpy` for `pizero_z4`. The per-file flags now match DSPi's `CMakeLists.txt` exactly, which adds `-O3` for seven control-path files and `-O3 -ffp-contract=off` for `rta_bass.c`.
+
+**Result.** A block now takes 24,200 cycles (24.2 us), and `cpu0_load` reads 2%. That is 17,900 instructions at 0.74 instructions per cycle, with few cache misses. With Console's spectrum view open, the remaining time splits as follows.
+
+| Share | Where |
+|---|---|
+| 42% | `process_input_block()` itself, a third of it in the output peak meters |
+| 26% | `rta_bass_push`, the RTA's bass path, which runs only while the analyser is read |
+| 18% | The output ring stand-ins, which copy the real drivers' bookkeeping and memory traffic |
+| 4% | `memset` |
+
+Per clock cycle the A53 is now only about as fast as the M33 on this code. DSPi's DSP code is scalar, single-precision floating point with long dependency chains, and the in-order A53 has a 4-cycle floating-point latency, where the M33's is about 1. Going further would mean restructuring DSPi's loops, for example processing channels side by side with NEON, which is outside this port's no-changes rule.
+
