@@ -24,7 +24,7 @@ PREAMBLES = {"X": 0b11001001, "Y": 0b01101001, "Z": 0b00111001}
 
 def smi_stats(dev):
     raw = bytes(dev.ctrl_transfer(0xC0, 0x4F, 0, 0, 372, timeout=500))
-    s = read_stats(dev)
+    s = read_stats(dev, raw)    # the same reply, so frames and uptime are sampled together
     if s["version"] < 7:
         raise SystemExit(f"FAIL: stats version {s['version']}, need 7 (load the SMI pizero_z4.img)")
     d = dict(zip(SMI_FIELDS, struct.unpack_from("<12I", raw, 300)))

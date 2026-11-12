@@ -366,3 +366,32 @@ Code:
 **Rates.** 44.1, 96 and 48 kHz each decode with zero parity or clock errors after a rate change from the host. The 44.1 kHz switch moves PLLA live from b48 to b44 and back.
 
 **Verdict.** Phase 2 passes. Phase 3 (switch timing and a 50-switch loop) is next.
+
+## 11. Phase 3 results (2026-11-12)
+
+Code:
+- **Settling capture.** `pll_out.c` counts the SMI clock in back-to-back 1 ms windows across a family move, with PLLA moved at the start of the third window. It runs from bench request `0x46` op 5, read back with an IN request (wValue 1), and is checked with `tools/pll_settle.py`. It blocks the main loop for the capture, so it is for the bench only.
+- **`smi_check.py`** now takes the frame count and the timestamp from the same stats reply. Before, they came from two requests, so host latency between them looked like lost frames.
+
+**Settling.**
+- **Moving down (b48 to b44):** the window that contains the write already reads within one count (27 to 30 ppm) of the new rate, and FLOCKA never clears.
+- **Moving up (b44 to b48):** that window is short by one or two counts, a few tens of nanoseconds of clock time, and the next window is exact.
+- **Against the plan:** the clock never stops, and a family switch settles in well under 1 ms, against the 20 ms the plan allowed.
+
+**51 rate changes from the host.** The rates cycled through 44.1, 48 and 96 kHz, 17 times each. Every change decoded with zero parity or clock errors on both S/PDIF slots, stayed on PLLA, and counted exactly on the SMI clock: 33.868800 MHz (twice 33.868803 MHz, one count), 36.864000 MHz and 73.728000 MHz. After the `smi_check.py` fix, the frame count over the 3 s check stays within 1 ms of timestamp rounding at every rate. `uac2_stream_check.py 3` passes.
+
+**Residual at each rate.** These are 3-minute soaks; the figure is the mean of the feedback controller's long-window rate over the last 90 s.
+
+| Rate | Mean | Range |
+|---|---|---|
+| 44.1 kHz | +2.36 ppm | +1.5 to +2.9 |
+| 48 kHz | +2.47 ppm | +1.9 to +4.1 |
+| 96 kHz | +2.44 ppm | +0.8 to +4.0 |
+
+The three means agree within 0.11 ppm, inside the 1 ppm criterion. As expected, the residual is the crystal against the host's USB frame clock and does not depend on the rate.
+
+**PLLA against PLLD across rate switches.** Nine switches with the stream stopped between them gave the same slot 0 underrun frames on PLLD (568907) and PLLA (569180), no ring drops, and no slot drops. The underruns are the gaps between streams.
+
+**USB hang.** The runs above exposed a hang of USB control transfers under rapid stream starts, stops and rate changes. It happened on PLLD with PLLA untouched as well, so it is not part of this work. It was caused by and fixed in the DWC2 driver; see `PiZero_Z0_bringup.md` section 21.
+
+**Verdict.** Phase 3 passes. Phase 4, jitter verification, needs an instrument and is recorded as not verified for now, as its pass criterion allows. Phase 5 (fine trim) is next.

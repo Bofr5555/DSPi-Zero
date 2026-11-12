@@ -42,6 +42,18 @@ bool pll_out_select(uint32_t row);
 uint32_t pll_out_smi_row(uint32_t freq, uint32_t *divi);
 void pll_out_set_in_use(bool on);                   // the SMI runs from plla_per: bench moves that hold it are refused
 
+// Settling capture: the SMI clock counted in back-to-back 1 ms windows, with PLLA moved to a row at the
+// start of window PLL_CAPTURE_PRE. Bench only: it blocks the main loop for the whole capture.
+#define PLL_CAPTURE_MAX 64u
+#define PLL_CAPTURE_PRE 2u
+typedef struct {
+    uint32_t seq, row, from_row, mux, gate, n;
+    uint32_t count[PLL_CAPTURE_MAX];
+    int32_t start_us[PLL_CAPTURE_MAX];      // window start from the write, negative before it
+} pll_out_capture_t;
+void pll_out_capture_request(uint32_t row, uint32_t n);
+const pll_out_capture_t *pll_out_capture(void);
+
 void pll_out_request(uint32_t row);                 // carried out by pll_out_poll()
 void pll_out_count_request(uint32_t mux, uint32_t osc_cycles);
 void pll_out_pcm_clock(uint32_t src, uint32_t divi);   // integer divider, no MASH; divi 0 stops it

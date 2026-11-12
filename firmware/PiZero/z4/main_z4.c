@@ -44,6 +44,7 @@
 #include "smi_out.h"
 #include "clk_dump.h"
 #include "pll_out.h"
+#include "device/dcd.h"
 #include "z4_prof.h"
 
 uint32_t tusb_time_millis_api(void) {
@@ -52,7 +53,32 @@ uint32_t tusb_time_millis_api(void) {
 
 static void feedback_measure(void);
 
+// USB event accounting: events the DWC2 driver posted against events TinyUSB queued. TinyUSB drops
+// an event when its queue is full, and a lost SETUP or EP0 completion leaves control transfers stuck.
+// Kinds are 0 SETUP, 1 transfer complete, 2 other bus events, 3 SOF and deferred calls.
+#define UH_SETUPS 8u
+typedef struct {
+    uint32_t magic, posted[4], queued[4];
+    uint32_t gap_max_us, gap_max_rate, gap_max_alt, gaps_over_4ms, tud_calls;
+    // Hang watch: a snapshot at the moment control transfers were found stuck, before reconnecting.
+    uint32_t usb_irqs, ep0_done, recoveries, trigger, trigger_ms, setups_since_done;
+    uint32_t armed;         // trigger 3 is armed by a 0x45 read with wValue 1, and fires once
+    uint32_t snap[32];      // see usb_watch_snapshot()
+    struct uh_setup {
+        uint32_t ms, done;
+        uint8_t pkt[8];
+    } setup[UH_SETUPS];     // the last SETUPs before the trigger, oldest first, done if EP0 completed after
+    uint32_t wait_timeouts;     // DWC2 endpoint-disable waits that gave up (dcd_dwc2.c patch 3)
+} usb_health_t;
+static usb_health_t uh = {.magic = 0x48425355u};   // "USBH"
+
+static unsigned uh_kind(uint32_t id) {
+    return id == DCD_EVENT_SETUP_RECEIVED ? 0u : id == DCD_EVENT_XFER_COMPLETE ? 1u
+           : (id == DCD_EVENT_SOF || id == USBD_EVENT_FUNC_CALL) ? 3u : 2u;
+}
+
 static void usb_irq(void) {
+    uh.usb_irqs++;
     tud_int_handler(0);
     feedback_measure();
     // Read back from the controller so its interrupt-clear writes have landed before we return.
@@ -592,14 +618,34 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         }
         return true;
     }
+    // 0x45: USB event accounting (see usb_health_t); wValue 1 also clears the longest main loop gap.
+    if (bench && req->bRequest == 0x45 && in) {
+        static usb_health_t copy;
+        if (stage == CONTROL_STAGE_SETUP) {
+            extern volatile uint32_t dwc2_pizero_wait_timeouts;
+            uh.wait_timeouts = dwc2_pizero_wait_timeouts;
+            copy = uh;
+            if (req->wValue == 1) {
+                uh.gap_max_us = 0;
+                uh.armed = 1;
+            }
+            return tud_control_xfer(rhport, req, &copy, req->wLength < sizeof(copy) ? req->wLength : sizeof(copy));
+        }
+        return true;
+    }
     // 0x46: PLLA (PiZero_PLLA_plan.md phase 1). OUT wValue 1 retunes to row wIndex, 2 drives the unused
     // PCM clock from source wIndex >> 12 with integer divider wIndex & 0xFFF, 3 starts the frequency
     // counter on mux wIndex & 0xFF for (wIndex >> 8) x 192000 oscillator cycles, 4 puts the SMI on PLLA
-    // (wIndex 1) or PLLD (0). IN returns the status.
+    // (wIndex 1) or PLLD (0), 5 captures settling into row wIndex & 0xFF over wIndex >> 8 windows. IN returns
+    // the status, or with wValue 1 the settling capture.
     if (bench && req->bRequest == 0x46) {
         static pll_out_status_t pst;
         if (stage != CONTROL_STAGE_SETUP) {
             return true;
+        }
+        if (in && req->wValue == 1) {
+            const pll_out_capture_t *c = pll_out_capture();
+            return tud_control_xfer(rhport, req, (void *)c, req->wLength < sizeof(*c) ? req->wLength : sizeof(*c));
         }
         if (in) {
             pll_out_status(&pst);
@@ -612,6 +658,8 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_control_requ
         } else if (req->wValue == 3) {
             uint32_t gates = req->wIndex >> 8;
             pll_out_count_request(req->wIndex & 0xFFu, (gates ? gates : 1u) * 192000u);
+        } else if (req->wValue == 5) {
+            pll_out_capture_request(req->wIndex & 0xFFu, req->wIndex >> 8);
         } else if (req->wValue == 4) {
             smi_source_request = req->wIndex;
         } else {
@@ -972,7 +1020,103 @@ static void consume_task(void) {
 // ---------------------------------------------------------------------------------------------------
 // Hooks for DSPi and z4_mainloop.c
 
+void __real_dcd_event_handler(dcd_event_t const *event, bool in_isr);
+static uint32_t ep0_done_us;
+static struct uh_setup setup_live[UH_SETUPS];
+
+void __wrap_dcd_event_handler(dcd_event_t const *event, bool in_isr) {
+    uh.posted[uh_kind(event->event_id)]++;
+    if (event->event_id == DCD_EVENT_SETUP_RECEIVED) {
+        for (unsigned i = 0; i + 1 < UH_SETUPS; i++) {
+            setup_live[i] = setup_live[i + 1];
+        }
+        setup_live[UH_SETUPS - 1].ms = board_micros() / 1000u;
+        setup_live[UH_SETUPS - 1].done = 0;
+        memcpy(setup_live[UH_SETUPS - 1].pkt, &event->setup_received, 8);
+        uh.setups_since_done++;
+    } else if (event->event_id == DCD_EVENT_XFER_COMPLETE && (event->xfer_complete.ep_addr & 0x7Fu) == 0) {
+        uh.ep0_done++;
+        setup_live[UH_SETUPS - 1].done = 1;
+        uh.setups_since_done = 0;
+        ep0_done_us = board_micros();
+    }
+    __real_dcd_event_handler(event, in_isr);
+}
+
+static void usb_watch_snapshot(uint32_t trigger) {
+    static const uint16_t regs[] = {0x008, 0x010, 0x014, 0x018, 0x01C, 0x804, 0x808, 0x818, 0x81C, 0x900, 0x908,
+                                    0x910, 0xB00, 0xB08, 0xB10, 0x024, 0xB20, 0xB28, 0xB30, 0x920, 0x928, 0x940,
+                                    0x948, 0x960, 0x02C, 0x000, 0xE00, 0x028};
+    for (unsigned i = 0; i < 28; i++) {
+        uh.snap[i] = DWC2_R(regs[i]);
+    }
+    uh.snap[28] = *(volatile uint32_t *)0x3F00B204u;    // ARM IRQ pending 1
+    uh.snap[29] = *(volatile uint32_t *)0x3F00B210u;    // IRQ enable 1
+    uint32_t cpsr;
+    __asm__ volatile("mrs %0, cpsr" : "=r"(cpsr));
+    uh.snap[30] = cpsr;
+    uh.snap[31] = current_alt | current_rate << 8;
+    memcpy(uh.setup, setup_live, sizeof(setup_live));
+    uh.trigger = trigger;
+    uh.trigger_ms = board_micros() / 1000u;
+}
+
+// Main loop, every 50 ms. Trigger 1: SETUPs keep arriving but EP0 completes nothing for 3 s. Trigger 2:
+// the controller has an enabled interrupt (or RX FIFO data, even masked) pending and the IRQ handler
+// has not run for 150 ms. Trigger 3, once armed: EP0 completes nothing for 8 s, whether or not SETUPs arrive.
+// Either way it snapshots, then disconnects and reconnects so the host re-enumerates (bench diagnosis).
+static void usb_watch(void) {
+    static uint32_t last_us, last_irqs, pending_runs;
+    uint32_t now = board_micros();
+    if (now - last_us < 50000u) {
+        return;
+    }
+    last_us = now;
+    uint32_t sts = DWC2_R(0x014);
+    uint32_t pend = (sts & DWC2_R(0x018)) | (sts & (1u << 4));    // RXFLVL counts even while masked
+    pending_runs = (pend && uh.usb_irqs == last_irqs) ? pending_runs + 1u : 0;
+    last_irqs = uh.usb_irqs;
+    uint32_t trigger = 0;
+    int32_t idle_us = (int32_t)(now - ep0_done_us);     // signed: an IRQ may have updated it since `now`
+    if (uh.setups_since_done >= 3u && idle_us > 3000000) {
+        trigger = 1;
+    } else if (pending_runs >= 3u) {
+        trigger = 2;
+    } else if (uh.armed && idle_us > 8000000) {
+        trigger = 3;
+        uh.armed = 0;
+    }
+    if (!trigger) {
+        return;
+    }
+    usb_watch_snapshot(trigger);
+    uh.recoveries++;
+    uh.setups_since_done = 0;
+    ep0_done_us = now;
+    pending_runs = 0;
+    tud_disconnect();
+    board_delay_us(200000);
+    tud_connect();
+}
+
+void tud_event_hook_cb(uint8_t rhport, uint32_t eventid, bool in_isr) {
+    (void)rhport;
+    (void)in_isr;
+    uh.queued[uh_kind(eventid)]++;
+}
+
 void z4_service_producer(void) {
+    static uint32_t last;
+    uint32_t now = board_micros();
+    uint32_t gap = now - last;
+    if (last && gap > uh.gap_max_us) {
+        uh.gap_max_us = gap;
+        uh.gap_max_rate = current_rate;
+        uh.gap_max_alt = current_alt;
+    }
+    uh.gaps_over_4ms += last && gap > 4000u;
+    uh.tud_calls++;
+    last = now;
     tud_task();
     consume_task();
     input_delivery_mark();
@@ -1046,6 +1190,7 @@ int main(void) {
     for (;;) {
         sensors_refresh();
         pll_out_poll();
+        usb_watch();
         if (smi_source_request != 0xFFFFFFFFu) {
             smi_out_set_source(smi_source_request);
             smi_source_request = 0xFFFFFFFFu;

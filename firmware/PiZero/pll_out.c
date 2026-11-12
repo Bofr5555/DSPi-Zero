@@ -59,6 +59,8 @@ static volatile uint32_t pending_row = 0xFFFFFFFFu;
 static volatile uint32_t pending_mux = 0xFFFFFFFFu, pending_osc;
 static uint32_t write_us, count_start_us;
 static const row_t *active;
+static volatile uint32_t pending_capture = 0xFFFFFFFFu;
+static pll_out_capture_t cap;
 
 static uint32_t micros(void) {
     return REG(0x3F003004u);
@@ -248,6 +250,56 @@ void pll_out_set_in_use(bool on) {
     in_use = on;
 }
 
+// Counts mux in back-to-back windows of gate oscillator cycles, moving PLLA to row at the start of window
+// PLL_CAPTURE_PRE. Blocks the main loop for the whole capture, so it is for the bench only.
+static void capture(uint32_t row, uint32_t mux, uint32_t gate, uint32_t n) {
+    counter_claimed = true;
+    st.count_state = COUNT_IDLE;
+    cap.row = row;
+    cap.mux = mux;
+    cap.gate = gate;
+    cap.n = n;
+    cap.from_row = st.row;
+    uint32_t t_write = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t t0 = micros();
+        if (i == PLL_CAPTURE_PRE) {
+            if (in_use && needs_hold(row)) {
+                st.refused++;
+                break;
+            }
+            retune(row);
+            t_write = t0;
+        }
+        wr(CM_TCNTCTL, CM_KILL);
+        wr(CM_TCNTCTL, (mux & 0xFu) | (mux >> 4) << 12);
+        wr(CM_OSCCOUNT, gate);
+        while (rd(CM_OSCCOUNT) != 0 || (REG(CM_TCNTCTL) & CM_BUSY)) {
+            if (micros() - t0 > gate / 19u + 2000u) {
+                break;
+            }
+        }
+        cap.count[i] = rd(CM_TCNTCNT);
+        cap.start_us[i] = (int32_t)t0;
+        if (i >= PLL_CAPTURE_PRE && st.state == PLL_WAITING) {
+            lock_wait_step(false);
+        }
+    }
+    wr(CM_TCNTCTL, 0);
+    for (uint32_t i = 0; i < n; i++) {
+        cap.start_us[i] -= (int32_t)t_write;
+    }
+    cap.seq++;
+}
+
+void pll_out_capture_request(uint32_t row, uint32_t n) {
+    pending_capture = row | (n < PLL_CAPTURE_MAX ? n : PLL_CAPTURE_MAX) << 8;
+}
+
+const pll_out_capture_t *pll_out_capture(void) {
+    return &cap;
+}
+
 void pll_out_request(uint32_t row) {
     if (row < PLL_ROW_COUNT) {
         pending_row = row;
@@ -291,6 +343,11 @@ void pll_out_poll(void) {
         lock_wait_step(false);
     } else if (st.state == PLL_LOCKED && !(REG(CM_LOCK) & FLOCKA)) {
         st.lock_lost++;
+    }
+    uint32_t c = pending_capture;
+    if (c != 0xFFFFFFFFu && st.state != PLL_WAITING && st.count_state != COUNT_RUNNING) {
+        pending_capture = 0xFFFFFFFFu;
+        capture(c & 0xFFu, 27u, 19200u, c >> 8);     // the SMI clock, 1 ms windows
     }
     uint32_t mux = pending_mux;
     if (mux != 0xFFFFFFFFu && st.count_state != COUNT_RUNNING) {

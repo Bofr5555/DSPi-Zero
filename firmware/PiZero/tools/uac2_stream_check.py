@@ -36,8 +36,10 @@ def find_board():
     return None
 
 
-def read_stats(dev):
-    raw = bytes(dev.ctrl_transfer(0xC0, REQ_Z_GET_STATS, 0, 0, 256, timeout=500))
+def read_stats(dev, raw=None):
+    """Parses a stats reply; reads one if raw is not given."""
+    if raw is None:
+        raw = bytes(dev.ctrl_transfer(0xC0, REQ_Z_GET_STATS, 0, 0, 256, timeout=500))
     magic, version, uptime_ms, rate, alt, mounted, speed, _ = struct.unpack_from("<HHIIBBBB", raw)
     if magic != 0x5532:
         return None

@@ -354,6 +354,8 @@ cmake --build firmware/PiZero/build-zero2
 /opt/homebrew/bin/python3.14 firmware/PiZero/tools/uac2_stream_check.py 20
 ```
 
+*Update (2026-11-12): `tusb_dwc2/dcd_dwc2.c` now carries a third patch, for a control-pipe hang under rapid stream switching. See section 21.*
+
 *Update (2026-11-11): data OUT now runs every 1 ms (`bInterval` 4, 582 bytes maximum, an 8-packet FIFO), not every microframe. See section 15 for why, and for the OUT parity search that makes it work.*
 
 **Device** (`uac2/usb_descriptors.c`). The device is `2E8B:FEAA`, bcdDevice `0x0300`, "Weeb Labs DSPi Zero", with the board serial. The audio function is a UAC2 speaker with these entities:
@@ -660,3 +662,26 @@ There were no slot underruns, ring drops, host gaps or late compositions, and th
 
 **Settling.** DSPi's inner servo gain is deliberately gentle, 1/256 sample a millisecond per 48-frame bucket, so packet jitter stays out of the host's clock. A 30-frame fill error after a pipeline reset (a slot type switch, for example) takes about 30 s to clear, with no underruns on the way. That tuning is kept.
 
+
+## 21. USB control transfers hung under rapid stream switching
+
+*Added: 2026-11-12*
+
+**Symptom.** Starting and stopping streams with a rate change every few seconds hung the board's control pipe after 15 to 60 switches. The board stayed enumerated and the main loop kept running (the LED kept blinking), but every control request timed out, including GET_STATUS and string descriptors. macOS logged plain timeouts on endpoint 0 (`status 0xe00002d6`), not bus errors, so the controller was accepting SETUP packets and then NAKing. Only a power cycle recovered it, and while it lasted `coreaudiod` stalled every audio device on the Mac. It happened with the SMI on PLLD and PLLA untouched, so it is not related to the PLLA work.
+
+**Ruled out.** Bench request `0x45` (`tools/usb_health.py`) counts the events the DWC2 driver posts (through `-Wl,--wrap=dcd_event_handler`) against the events TinyUSB queues (`tud_event_hook_cb`), and records the longest gap between `tud_task()` calls. No SETUP or transfer completion was ever dropped from TinyUSB's 16-entry queue, and the longest gap stayed under 1.5 ms.
+
+**Cause.** Patch 1 in `tusb_dwc2/dcd_dwc2.c` pops the RX FIFO from thread context while it waits for global OUT NAK effective, which happens whenever an enabled OUT endpoint is disabled, as on every stream start or stop. A FIFO entry is popped in two reads, the status word and then its data. Patch 1 did this with interrupts enabled, so the USB interrupt could pop the same FIFO between the two reads, or pop the entry first. The two readers then fall out of step, and every later entry, SETUPs included, is misread, while the iso data endpoint keeps running. DSPi Console's polling (a 1312-byte spectrum analyzer read about every 60 ms) makes this much more likely, but is not the cause.
+
+**Fix, patch 3.**
+- Each thread-context pop runs with interrupts off and checks RXFLVL only after they are off, so the main loop and the interrupt never interleave.
+- The OUT endpoint-disable wait also pops while it waits.
+- Every disable wait gives up after 5 ms and counts it in `dwc2_pizero_wait_timeouts`, which the `0x45` reply reports.
+
+A first attempt ran the whole disable with interrupts off. That deadlocked the main loop (the LED went solid) after 19 switches, because the "endpoint disabled" wait also needs the RX FIFO drained.
+
+**Result.** 300 switches through 44.1, 48 and 96 kHz with DSPi Console and its spectrum analyzer polling (69336 SETUPs): no hang, no dropped events, and no wait timeouts. A second run of 300 with the Console closed was also clean.
+
+**Diagnostics left in for now.** These come out or become bench-only once the fix has had more time.
+- The `0x45` accounting.
+- A main-loop hang watch (`usb_watch()` in `z4/main_z4.c`). If SETUPs keep arriving with no EP0 completion for 3 s, if a USB interrupt is pending with no handler running for 150 ms, or (once armed by a `0x45` read with wValue 1) if EP0 completes nothing for 8 s, it snapshots the controller and the last eight SETUPs, then disconnects and reconnects so the record can be read.

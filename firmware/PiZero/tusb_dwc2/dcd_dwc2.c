@@ -1,8 +1,10 @@
 /* DSPi PiZero: patched copy of TinyUSB 0.18.0 src/portable/synopsys/dwc2/dcd_dwc2.c.
- * Two changes, each marked "DSPi PiZero patch". See Documentation/Porting/PiZero_Z0_bringup.md section 14.
+ * Three changes, each marked "DSPi PiZero patch". See Documentation/Porting/PiZero_Z0_bringup.md section 14.
  * 1. Disabling an enabled OUT endpoint in slave mode no longer waits forever for global OUT NAK effective.
  * 2. Isochronous endpoints with bInterval > 1 are queued on the (micro)frame parity the host actually
- *    uses, learned from the first packet that goes through, instead of "the next frame". */
+ *    uses, learned from the first packet that goes through, instead of "the next frame".
+ * 3. Patch 1's RX FIFO pops run with interrupts off, so it and the interrupt never interleave, and the
+ *    endpoint disable waits give up after 5 ms instead of hanging the device. */
 
 /*
  * The MIT License (MIT)
@@ -292,8 +294,38 @@ static void handle_rxflvl_irq(uint8_t rhport);   // DSPi PiZero patch 1
 #endif
 
 
+// DSPi PiZero patch 3: an RX FIFO entry is popped in two reads (status, then data). Patch 1 pops from
+// thread context, so each pop runs with interrupts off and looks for an entry only once they are off.
+// Otherwise the interrupt can pop in between, and every later entry, SETUPs included, is misread.
+static void rxfifo_pop_guarded(uint8_t rhport) {
+#if CFG_TUD_DWC2_SLAVE_ENABLE
+  dwc2_regs_t* dwc2 = DWC2_REG(rhport);
+  uint32_t cpsr;
+  __asm__ volatile("mrs %0, cpsr\n\tcpsid i" : "=r"(cpsr) :: "memory");
+  if (dwc2->gintsts & GINTSTS_RXFLVL) {
+    handle_rxflvl_irq(rhport);
+  }
+  __asm__ volatile("msr cpsr_c, %0" :: "r"(cpsr) : "memory");
+#else
+  (void) rhport;
+#endif
+}
+
+// DSPi PiZero patch 3: the disable waits give up after 5 ms and count it in dwc2_pizero_wait_timeouts
+// (read by the bench tools), so a wait that never ends cannot stop the device.
+volatile uint32_t dwc2_pizero_wait_timeouts;
+
+static bool pz_wait_expired(uint32_t t0) {
+  if (*(volatile uint32_t*) 0x3F003004u - t0 < 5000u) {   // BCM2837 system timer, 1 MHz
+    return false;
+  }
+  dwc2_pizero_wait_timeouts++;
+  return true;
+}
+
 static void edpt_disable(uint8_t rhport, uint8_t ep_addr, bool stall) {
   (void) rhport;
+  uint32_t t0;
 
   dwc2_regs_t* dwc2 = DWC2_REG(rhport);
   const uint8_t epnum = tu_edpt_number(ep_addr);
@@ -307,11 +339,13 @@ static void edpt_disable(uint8_t rhport, uint8_t ep_addr, bool stall) {
     } else {
       // Stop transmitting packets and NAK IN xfers.
       dep->diepctl |= DIEPCTL_SNAK;
-      while ((dep->diepint & DIEPINT_INEPNE) == 0) {}
+      t0 = *(volatile uint32_t*) 0x3F003004u;
+      while ((dep->diepint & DIEPINT_INEPNE) == 0 && !pz_wait_expired(t0)) {}
 
       // Disable the endpoint.
       dep->diepctl |= DIEPCTL_EPDIS | (stall ? DIEPCTL_STALL : 0);
-      while ((dep->diepint & DIEPINT_EPDISD_Msk) == 0) {}
+      t0 = *(volatile uint32_t*) 0x3F003004u;
+      while ((dep->diepint & DIEPINT_EPDISD_Msk) == 0 && !pz_wait_expired(t0)) {}
 
       dep->diepint = DIEPINT_EPDISD;
     }
@@ -328,19 +362,19 @@ static void edpt_disable(uint8_t rhport, uint8_t ep_addr, bool stall) {
       // anyway, and it can't be cleared by user code. If this while loop never
       // finishes, we have bigger problems than just the stack.
       dwc2->dctl |= DCTL_SGONAK;
-      while ((dwc2->gintsts & GINTSTS_BOUTNAKEFF_Msk) == 0) {
-#if CFG_TUD_DWC2_SLAVE_ENABLE
+      t0 = *(volatile uint32_t*) 0x3F003004u;
+      while ((dwc2->gintsts & GINTSTS_BOUTNAKEFF_Msk) == 0 && !pz_wait_expired(t0)) {
         // DSPi PiZero patch 1: in slave mode the core only reports global OUT NAK effective once that
         // status entry is popped from the RX FIFO. Pop it here, or a polled stack waits forever.
-        if (dwc2->gintsts & GINTSTS_RXFLVL) {
-          handle_rxflvl_irq(rhport);
-        }
-#endif
+        rxfifo_pop_guarded(rhport);
       }
 
-      // Ditto here disable the endpoint.
+      // Ditto here disable the endpoint. Patch 3: entries ahead of the disable are popped here too.
       dep->doepctl |= DOEPCTL_EPDIS | (stall ? DOEPCTL_STALL : 0);
-      while ((dep->doepint & DOEPINT_EPDISD_Msk) == 0) {}
+      t0 = *(volatile uint32_t*) 0x3F003004u;
+      while ((dep->doepint & DOEPINT_EPDISD_Msk) == 0 && !pz_wait_expired(t0)) {
+        rxfifo_pop_guarded(rhport);
+      }
 
       dep->doepint = DOEPINT_EPDISD;
 
